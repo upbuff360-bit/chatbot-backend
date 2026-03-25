@@ -1,9 +1,0 @@
-SAP B1
-SAP Business One
-Service Layer Integration
-S/4HANA
-SAP S/4HANA
-OData · RFC APIs
-
-
-<div class="w-full h-full flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 p-6"><div class="grid grid-cols-3 gap-4"><div class="flex flex-col items-center gap-2"><div class="w-14 h-14 rounded-xl bg-white flex items-center justify-center shadow border"><span class="text-xs font-bold text-blue-600"><img src="http://4.151.8.142:4000/uploads/logo/oracle-integration-with-upbuff-crm.png"></span></div><span class="text-xs text-gray-500">Oracle ERP</span></div><div class="flex flex-col items-center gap-2"><div class="w-14 h-14 rounded-xl bg-white flex items-center justify-center shadow border"><span class="text-xs font-bold text-red-500"><img src="http://4.151.8.142:4000/uploads/logo/epicore-integration-with-upbuff-crm.png"></span></div><span class="text-xs text-gray-500">Epicor ERP</span></div><div class="flex flex-col items-center gap-2"><div class="w-14 h-14 rounded-xl bg-white flex items-center justify-center shadow border"><span class="text-xs font-bold text-green-600"><svg xmlns="http://www.w3.org/2000/svg" class="w-7 h-7 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg></span></div><span class="text-xs text-gray-500">Custom API</span></div></div></div>

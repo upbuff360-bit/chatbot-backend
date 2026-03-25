@@ -7,3 +7,5 @@ frontend/node_modules/
 frontend/.next/
 frontend/.env.local
 *.log
+"data/" 
+"*.zip" 
