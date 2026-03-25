@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+persist/
+.env
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+*.log
