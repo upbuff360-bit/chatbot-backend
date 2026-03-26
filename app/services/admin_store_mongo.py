@@ -95,7 +95,7 @@ class AdminStoreMongo:
         email: str,
         hashed_password: str,
         tenant_id: str,
-        role: str = "owner",
+        role: str = "customer",
         plan: str = "free",
         name: str | None = None,
     ) -> dict[str, Any]:
@@ -483,7 +483,7 @@ class AdminStoreMongo:
         invite = await self._agent_invitations.find_one({"token": token, "status": "pending"})
         if not invite:
             return None
-        if invite.get("expires_at") and invite["expires_at"] <= _now():
+        if invite.get("expires_at") and invite["expires_at"].replace(tzinfo=timezone.utc) <= _now():
             await self._agent_invitations.update_one(
                 {"_id": invite["_id"]},
                 {"$set": {"status": "expired", "updated_at": _now()}},

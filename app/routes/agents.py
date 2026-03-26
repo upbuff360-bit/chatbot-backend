@@ -57,6 +57,15 @@ async def list_agents(
     return [_serialize(a) for a in valid]
 
 
+# @router.post("", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
+# async def create_agent(
+#     request: AgentCreateRequest,
+#     user: CurrentUser = Depends(get_current_user),
+#     store: AdminStoreMongo = Depends(_get_store),
+# ):
+#     await user.require_permission("agents", "write")
+#     agent = await store.create_agent(request.name, user.tenant_id, user.id)
+#     return _serialize(agent)
 @router.post("", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
 async def create_agent(
     request: AgentCreateRequest,
@@ -64,9 +73,16 @@ async def create_agent(
     store: AdminStoreMongo = Depends(_get_store),
 ):
     await user.require_permission("agents", "write")
+    if user.role != UserRole.SUPER_ADMIN:
+        subscription = await store.get_user_subscription(user.id)
+        if not subscription:
+            raise HTTPException(
+                status_code=402,
+                detail="No active plan assigned. Please contact your administrator to assign a plan before creating agents."
+            )
     agent = await store.create_agent(request.name, user.tenant_id, user.id)
     return _serialize(agent)
-
+    
 
 @router.get("/{agent_id}", response_model=AgentResponse)
 async def get_agent(

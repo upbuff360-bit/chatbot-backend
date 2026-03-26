@@ -125,7 +125,7 @@ app = FastAPI(
 # CORS
 _origins = [
     o.strip()
-    for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    for o in os.getenv("FRONTEND_ORIGINS", "*").split(",")
     if o.strip()
 ]
 if "*" in _origins:
