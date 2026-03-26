@@ -115,10 +115,16 @@ class AdminStoreMongo:
         return doc
 
     async def get_user_by_email(self, email: str) -> Optional[dict[str, Any]]:
-        return await self._users.find_one({"email": email})
+        doc = await self._users.find_one({"email": email})
+        if doc:
+            doc["_id"] = str(doc["_id"])
+        return doc
 
     async def get_user_by_id(self, user_id: str, tenant_id: str) -> Optional[dict[str, Any]]:
-        return await self._users.find_one({"_id": user_id, "tenant_id": tenant_id})
+        doc = await self._users.find_one({"_id": user_id, "tenant_id": tenant_id})
+        if doc:
+            doc["_id"] = str(doc["_id"])
+        return doc
 
     async def list_all_users(self, skip: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         """List all users across all tenants — super admin only. Paginated via skip/limit."""
