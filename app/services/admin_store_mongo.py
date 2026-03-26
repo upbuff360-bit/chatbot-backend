@@ -95,7 +95,7 @@ class AdminStoreMongo:
         email: str,
         hashed_password: str,
         tenant_id: str,
-        role: str = "owner",
+        role: str = "customer",
         plan: str = "free",
         name: str | None = None,
     ) -> dict[str, Any]:
