@@ -16,7 +16,7 @@ def _get_store() -> AdminStoreMongo:
 
 
 def _require_owner(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-    if user.role not in (UserRole.SUPER_ADMIN, UserRole.OWNER):
+    if user.role not in (UserRole.SUPER_ADMIN, UserRole.CUSTOMER):
         raise HTTPException(status_code=403, detail="Owner or super admin access required.")
     return user
 
