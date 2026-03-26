@@ -71,7 +71,7 @@ async def signup(request: SignupRequest, store: AdminStoreMongo = Depends(_get_s
         email=email,
         hashed_password=hashed,
         tenant_id=tenant_id,
-        role="owner",
+        role="customer",
         name=request.name or email.split("@")[0],
     )
     await store.accept_pending_agent_invites(email, user["_id"])
@@ -82,7 +82,7 @@ async def signup(request: SignupRequest, store: AdminStoreMongo = Depends(_get_s
             "email": user["email"],
             "name": user.get("name", ""),
             "tenant_id": tenant_id,
-            "role": "owner",
+            "role": "customer",
         }
     )
 

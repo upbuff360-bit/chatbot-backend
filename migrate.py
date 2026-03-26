@@ -84,7 +84,7 @@ async def run_migration():
             "email"          : OWNER_EMAIL,
             "hashed_password": pwd_context.hash(OWNER_PASSWORD),
             "tenant_id"      : tenant_id,
-            "role"           : "owner",
+            "role"           : "customer",
             "plan"           : "free",
             "created_at"     : _now(),
             "updated_at"     : _now(),

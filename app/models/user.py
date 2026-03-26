@@ -9,9 +9,6 @@ from pydantic import BaseModel, Field
 
 class UserRole(str, Enum):
     SUPER_ADMIN = "super_admin"
-    OWNER = "owner"
-    ADMIN = "admin"
-    VIEWER = "viewer"
     CUSTOMER = "customer"
 
 
@@ -23,7 +20,7 @@ class UserDocument(BaseModel):
     hashed_password: str
     tenant_id: str
     name: Optional[str] = None
-    role: str = "owner"    # plain string — supports custom role names beyond the enum
+    role: str = "customer"    # plain string — supports custom role names beyond the enum
     plan: str = "free"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
