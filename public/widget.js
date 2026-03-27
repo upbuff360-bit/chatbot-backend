@@ -351,7 +351,13 @@
 
     const textEl = document.createElement("p");
     textEl.style.margin = "0";
-    textEl.textContent = text;
+    textEl.innerHTML = text
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+      .replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>")
+      .replace(/\*(.*?)\*/g,"<em>$1</em>")
+      .replace(/^- (.+)$/gm,"<li>$1</li>")
+      .replace(/(<li>.*<\/li>)/gs,"<ul style='margin:4px 0;padding-left:16px;'>$1</ul>")
+      .replace(/\n/g,"<br>");
 
     const timeEl = document.createElement("p");
     timeEl.title = now.toLocaleString();
