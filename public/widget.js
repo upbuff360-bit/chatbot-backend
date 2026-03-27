@@ -781,14 +781,24 @@
         const titleEl = document.getElementById("cw-title");
         if (titleEl && s.display_name) titleEl.textContent = s.display_name;
         // Apply dynamic color from settings
-        if (s.primary_color) {
+       if (s.primary_color) {
           const dynColor = s.primary_color;
           const bubbleEl = document.getElementById("cw-bubble");
           const headerEl = document.getElementById("cw-header");
           const sendEl2  = document.getElementById("cw-send");
+          const histNewEl = document.getElementById("cw-history-new");
           if (bubbleEl) bubbleEl.style.background = dynColor;
           if (headerEl) headerEl.style.background = dynColor;
           if (sendEl2)  sendEl2.style.background  = dynColor;
+          if (histNewEl) histNewEl.style.background = dynColor;
+          // Update input focus and user message color
+          const styleEl = document.createElement('style');
+          styleEl.textContent = `
+            #cw-input:focus { border-color: ${dynColor} !important; }
+            .cw-msg.user .cw-bubble-text { background: ${dynColor} !important; }
+            .cw-confirm-ok { background: ${dynColor} !important; }
+          `;
+          document.head.appendChild(styleEl);
         }
         showPreview(_welcomeMsg);
       } else { showPreview(_welcomeMsg); }
