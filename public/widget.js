@@ -127,6 +127,8 @@
     .cw-hist-empty{padding:40px 14px;text-align:center;font-size:13px;color:${subText};font-family:system-ui,sans-serif;}
 
     #cw-powered{text-align:center;font-size:10px;color:${subText};padding:4px 0;background:${bgColor};border-top:1px solid ${bubbleBorder};font-family:system-ui,sans-serif;flex-shrink:0;}
+#cw-powered a{color:${primaryColor};text-decoration:none;font-weight:600;}
+#cw-powered a:hover{text-decoration:underline;}
     #cw-input-row{display:flex;align-items:center;gap:8px;padding:10px 12px;background:${bgColor};border-top:1px solid ${bubbleBorder};flex-shrink:0;}
     #cw-input{flex:1;border:1px solid ${inputBorder};background:${inputBg};color:${textColor};border-radius:20px;padding:8px 14px;font-size:13px;font-family:system-ui,sans-serif;outline:none;transition:border-color .15s;}
     #cw-input:focus{border-color:${primaryColor};}
