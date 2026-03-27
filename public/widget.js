@@ -780,6 +780,16 @@
         _welcomeMsg = s.welcome_message || "Hi! What can I help you with?";
         const titleEl = document.getElementById("cw-title");
         if (titleEl && s.display_name) titleEl.textContent = s.display_name;
+        // Apply dynamic color from settings
+        if (s.primary_color) {
+          const dynColor = s.primary_color;
+          const bubbleEl = document.getElementById("cw-bubble");
+          const headerEl = document.getElementById("cw-header");
+          const sendEl2  = document.getElementById("cw-send");
+          if (bubbleEl) bubbleEl.style.background = dynColor;
+          if (headerEl) headerEl.style.background = dynColor;
+          if (sendEl2)  sendEl2.style.background  = dynColor;
+        }
         showPreview(_welcomeMsg);
       } else { showPreview(_welcomeMsg); }
     } catch { showPreview(_welcomeMsg); }
