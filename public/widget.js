@@ -230,7 +230,7 @@
     <div id="cw-confirm" style="display:none;position:absolute;inset:0;background:rgba(0,0,0,.45);z-index:20;align-items:center;justify-content:center;">
       <div id="cw-confirm-box"></div>
     </div>
-    <div id="cw-powered">Powered by Upbuff AI</div>
+    <div id="cw-powered">Powered by <a href = "https://upbuff.com/" target="blank"><b>UpBuff AI</b></a></div>
     <div id="cw-input-row">
       <input id="cw-input" type="text" placeholder="Message..." autocomplete="off" />
       <button id="cw-send" disabled aria-label="Send">
