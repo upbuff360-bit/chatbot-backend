@@ -426,7 +426,20 @@ class WebsiteService:
                 "Playwright is not installed. Run: pip install playwright && playwright install chromium"
             )
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            # --no-sandbox and --disable-setuid-sandbox are REQUIRED on
+            # Google Cloud Run (and any container runtime like Docker) because
+            # the outer container already provides isolation — Chrome's own
+            # sandbox cannot create a nested namespace and crashes without these flags.
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",   # /dev/shm is only 64 MB on Cloud Run; use /tmp instead
+                    "--disable-gpu",              # no GPU in Cloud Run
+                    "--single-process",           # reduces memory footprint in constrained environments
+                ],
+            )
             try:
                 page = browser.new_page(user_agent=USER_AGENT)
                 page.goto(
