@@ -403,18 +403,24 @@ class WebsiteService:
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--single-process",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
                 ],
             )
 
             try:
                 page = browser.new_page(user_agent=USER_AGENT)
 
-                page.goto(
-                    url,
-                    wait_until="networkidle",
-                    timeout=int(self.request_timeout * 1000),
-                )
+                try:
+                    page.goto(
+                        url,
+                        wait_until="domcontentloaded",  # 🔥 safer than networkidle
+                        timeout=15000
+                    )
+                except Exception as e:
+                    print("❌ Page load failed:", url, e)
+                    return "", "text/html", url, []
 
                 # 🔥 REQUIRED for Next.js
                 page.wait_for_timeout(2000)
