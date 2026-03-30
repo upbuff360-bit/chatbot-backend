@@ -86,6 +86,7 @@ class RAGPipeline:
         source_type: str,
         source_name: str,
         text: str,
+        category: str | None = None,
     ) -> int:
         """Ingest one document: save chunks to MongoDB then embed into Qdrant."""
         if not text.strip() or not self.embedding_service.is_configured():
@@ -106,6 +107,7 @@ class RAGPipeline:
             source_type=source_type,
             source_name=source_name,
             chunks=chunks,
+            category=category,
         )
 
         embeddings = self.embedding_service.embed_texts(chunks)

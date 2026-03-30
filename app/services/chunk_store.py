@@ -33,6 +33,7 @@ class ChunkStore:
         source_type: str,
         source_name: str,
         chunks: list[str],
+        category: str | None = None,
     ) -> list[str]:
         """Save chunks to MongoDB. Returns list of chunk IDs in same order."""
         if not chunks:
@@ -45,7 +46,7 @@ class ChunkStore:
         for i, content in enumerate(chunks):
             chunk_id = str(uuid4())
             ids.append(chunk_id)
-            docs.append({
+            doc: dict = {
                 "_id": chunk_id,
                 "tenant_id": tenant_id,
                 "agent_id": agent_id,
@@ -55,7 +56,10 @@ class ChunkStore:
                 "chunk_index": i,
                 "content": content,
                 "created_at": now,
-            })
+            }
+            if category:
+                doc["category"] = category
+            docs.append(doc)
 
         await self._chunks.insert_many(docs)
         return ids
