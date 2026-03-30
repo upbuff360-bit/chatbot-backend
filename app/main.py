@@ -89,7 +89,7 @@ async def _startup_index_agents(s: AdminStoreMongo, cs: ChunkStore) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global store, chunk_store
+    global store, chunk_store, crawl_job_store
 
     await connect()
     await create_indexes()
@@ -97,9 +97,11 @@ async def lifespan(_: FastAPI):
     db = get_database()
     store = AdminStoreMongo(db=db, agents_root=os.getenv("AGENTS_DATA_ROOT", "./data/agents"))
     chunk_store = ChunkStore(db=db)
+    crawl_job_store = CrawlJobStore(db=db)
 
-    # Ensure MongoDB chunk indexes exist
+    # Ensure MongoDB indexes exist
     await chunk_store.ensure_indexes()
+    await crawl_job_store.ensure_indexes()
 
     # Backfill display_id for existing agents (one-time, safe to run multiple times)
     await store.backfill_agent_display_ids()
@@ -193,7 +195,7 @@ class _CrawlJobResponse(_BaseModel):
     source_type: str = "website"
 
 
-crawl_job_store = CrawlJobStore()
+crawl_job_store: CrawlJobStore | None = None
 
 
 def _normalize_url(url: str) -> str:
@@ -203,27 +205,24 @@ def _normalize_url(url: str) -> str:
 
 
 async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, url: str) -> None:
-    global store, chunk_store
+    global store, chunk_store, crawl_job_store
+    from app.category_detector import detect_page_category
     from app.rag_pipeline import RAGPipeline
     from app.website_service import WebsiteService
 
-    if store is None or chunk_store is None:
-        crawl_job_store.update(
+    if store is None or chunk_store is None or crawl_job_store is None:
+        await crawl_job_store.update(
             job_id,
-            status="failed",
-            stage="failed",
+            status="failed", stage="failed",
             error="Crawl services are not ready.",
             message="Crawl services are not ready.",
         )
         return
 
-    crawl_job_store.update(
+    await crawl_job_store.update(
         job_id,
-        status="running",
-        stage="crawling",
-        current_url=url,
-        message="Starting website crawl.",
-        error=None,
+        status="running", stage="crawling",
+        current_url=url, message="Starting website crawl.", error=None,
     )
 
     try:
@@ -232,42 +231,39 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
         website_dir.mkdir(parents=True, exist_ok=True)
         website_service = WebsiteService(website_directory=website_dir)
 
-        def on_progress(update: dict[str, int | str | None]) -> None:
-            crawl_job_store.update(
-                job_id,
-                stage=str(update.get("stage") or "crawling"),
-                discovered_pages=int(update.get("discovered_pages") or 0),
-                indexed_pages=int(update.get("indexed_pages") or 0),
-                current_url=str(update.get("current_url")) if update.get("current_url") else None,
-                message=str(update.get("message")) if update.get("message") else None,
+        def on_progress(update: dict) -> None:
+            asyncio.run_coroutine_threadsafe(
+                crawl_job_store.update(
+                    job_id,
+                    stage=str(update.get("stage") or "crawling"),
+                    discovered_pages=int(update.get("discovered_pages") or 0),
+                    indexed_pages=int(update.get("indexed_pages") or 0),
+                    current_url=str(update.get("current_url")) if update.get("current_url") else None,
+                    message=str(update.get("message")) if update.get("message") else None,
+                ),
+                loop,
             )
 
         crawl_result = await loop.run_in_executor(
-            None,
-            lambda: website_service.crawl(url, progress_callback=on_progress),
+            None, lambda: website_service.crawl(url, progress_callback=on_progress)
         )
         await loop.run_in_executor(None, lambda: website_service.save_crawl(crawl_result))
 
         stored_pages = website_service.list_source_pages(url)
-
-        combined_text = "\n\n".join(page.text for page in stored_pages if page.text.strip())
-        if not combined_text.strip():
+        if not stored_pages or not any(p.text.strip() for p in stored_pages):
             raise ValueError("No text extracted from website.")
 
         doc = await store.upsert_website_source(
-            agent_id=agent_id,
-            tenant_id=tenant_id,
-            user_id=user_id,
+            agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
             display_name=stored_pages[0].title if stored_pages else (crawl_result.display_name or url),
-            source_url=url,
-            status="indexing",
+            source_url=url, status="indexing",
         )
-        crawl_job_store.update(
+        await crawl_job_store.update(
             job_id,
             stage="indexing",
             message=f"Indexing {len(stored_pages)} page(s)...",
             discovered_pages=len(stored_pages),
-            indexed_pages=len(stored_pages),
+            indexed_pages=0,
             current_url=None,
             document_id=doc["id"],
             document_name=doc["file_name"],
@@ -280,36 +276,44 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
             qa_directory=store.get_agent_qa_dir(agent_id),
             collection_name=agent_collection_name(agent_id),
         )
+        # Clear old chunks for this document
         chunk_ids = await chunk_store.get_chunk_ids_by_document(doc["id"])
         if chunk_ids:
             pipeline.remove_document(doc["id"], chunk_ids=chunk_ids)
             await chunk_store.delete_chunks_by_document(doc["id"])
-        await pipeline.ingest_single_document(
-            chunk_store=chunk_store,
-            tenant_id=tenant_id,
-            agent_id=agent_id,
-            document_id=doc["id"],
-            source_type="website",
-            source_name=url,
-            text=combined_text,
-        )
+
+        # Ingest each page separately with category detection
+        indexed = 0
+        for page in stored_pages:
+            page_text = page.text.strip()
+            if not page_text:
+                continue
+            page_category = detect_page_category(url=page.url, title=page.title, text=page_text)
+            page_input = f"{page.title}\n\n{page.url}\n\n{page_text}"
+            await pipeline.ingest_single_document(
+                chunk_store=chunk_store,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                document_id=doc["id"],
+                source_type="website",
+                source_name=page.url or url,
+                text=page_input,
+                category=page_category,
+            )
+            indexed += 1
+            await crawl_job_store.update(job_id, indexed_pages=indexed)
 
         doc = await store.upsert_website_source(
-            agent_id=agent_id,
-            tenant_id=tenant_id,
-            user_id=user_id,
+            agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
             display_name=stored_pages[0].title if stored_pages else (crawl_result.display_name or url),
-            source_url=url,
-            status="indexed",
+            source_url=url, status="indexed",
         )
-
-        crawl_job_store.update(
+        await crawl_job_store.update(
             job_id,
-            status="completed",
-            stage="completed",
-            message=f"Indexed {len(stored_pages)} page(s).",
+            status="completed", stage="completed",
+            message=f"Indexed {indexed} page(s).",
             discovered_pages=len(stored_pages),
-            indexed_pages=len(stored_pages),
+            indexed_pages=indexed,
             current_url=None,
             document_id=doc["id"],
             document_name=doc["file_name"],
@@ -318,52 +322,36 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
     except Exception as exc:
         if store is not None:
             await store.upsert_website_source(
-                agent_id=agent_id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                display_name=url,
-                source_url=url,
-                status="failed",
+                agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
+                display_name=url, source_url=url, status="failed",
             )
-        crawl_job_store.update(
-            job_id,
-            status="failed",
-            stage="failed",
-            error=str(exc),
-            message=str(exc),
+        err = str(exc)
+        if "401" in err or "invalid_api_key" in err.lower():
+            err = "Indexing failed: invalid or missing OpenAI API key."
+        elif "429" in err or "rate_limit" in err.lower():
+            err = "Indexing failed: OpenAI rate limit exceeded."
+        await crawl_job_store.update(
+            job_id, status="failed", stage="failed", error=err, message=err
         )
-
-
 async def _run_single_page_crawl(
-    job_id: str,
-    agent_id: str,
-    tenant_id: str,
-    document_id: str,
-    url: str,
+    job_id: str, agent_id: str, tenant_id: str, document_id: str, url: str,
 ) -> None:
-    global store, chunk_store
+    global store, chunk_store, crawl_job_store
+    from app.category_detector import detect_page_category
     from app.rag_pipeline import RAGPipeline
     from app.website_service import WebsiteService
 
-    if store is None or chunk_store is None:
-        crawl_job_store.update(
-            job_id,
-            status="failed",
-            stage="failed",
-            error="Crawl services are not ready.",
-            message="Crawl services are not ready.",
+    if store is None or chunk_store is None or crawl_job_store is None:
+        await crawl_job_store.update(
+            job_id, status="failed", stage="failed",
+            error="Crawl services are not ready.", message="Crawl services are not ready.",
         )
         return
 
-    crawl_job_store.update(
-        job_id,
-        status="running",
-        stage="crawling",
-        discovered_pages=1,
-        indexed_pages=0,
-        current_url=url,
-        message="Fetching page content.",
-        error=None,
+    await crawl_job_store.update(
+        job_id, status="running", stage="crawling",
+        discovered_pages=1, indexed_pages=0,
+        current_url=url, message="Fetching page content.", error=None,
     )
 
     try:
@@ -381,29 +369,17 @@ async def _run_single_page_crawl(
         crawled_page = await loop.run_in_executor(None, lambda: website_service.crawl_single_page(url))
         website_service.create_source_page(
             str(document.get("source_url") or ""),
-            url=crawled_page.url,
-            title=crawled_page.title,
-            text=crawled_page.text,
+            url=crawled_page.url, title=crawled_page.title, text=crawled_page.text,
         )
 
-        crawl_job_store.update(
-            job_id,
-            stage="indexing",
-            discovered_pages=1,
-            indexed_pages=1,
-            current_url=crawled_page.url,
-            message="Indexing crawled page.",
-            document_id=document["id"],
-            document_name=document["file_name"],
+        await crawl_job_store.update(
+            job_id, stage="indexing", discovered_pages=1, indexed_pages=0,
+            current_url=crawled_page.url, message="Indexing crawled page.",
+            document_id=document["id"], document_name=document["file_name"],
         )
 
         pages = website_service.list_source_pages(str(document.get("source_url") or ""))
-        combined_text = "\n\n".join(
-            "\n\n".join(part for part in [page.title.strip(), page.url.strip(), page.text.strip()] if part)
-            for page in pages
-            if page.text.strip()
-        ).strip()
-        if not combined_text:
+        if not any(p.text.strip() for p in pages):
             raise ValueError("Website pages must contain readable text.")
 
         pipeline = RAGPipeline(
@@ -413,52 +389,45 @@ async def _run_single_page_crawl(
             qa_directory=store.get_agent_qa_dir(agent_id),
             collection_name=agent_collection_name(agent_id),
         )
-
         chunk_ids = await chunk_store.get_chunk_ids_by_document(document["id"])
         if chunk_ids:
             pipeline.remove_document(document["id"], chunk_ids=chunk_ids)
             await chunk_store.delete_chunks_by_document(document["id"])
 
-        await pipeline.ingest_single_document(
-            chunk_store=chunk_store,
-            tenant_id=tenant_id,
-            agent_id=agent_id,
-            document_id=document["id"],
-            source_type="website",
-            source_name=str(document.get("source_url") or ""),
-            text=combined_text,
-        )
+        # Re-ingest all pages (including the new one) with category detection
+        for page in pages:
+            page_text = page.text.strip()
+            if not page_text:
+                continue
+            page_category = detect_page_category(url=page.url, title=page.title, text=page_text)
+            page_input = "\n\n".join(p for p in [page.title.strip(), page.url.strip(), page_text] if p)
+            await pipeline.ingest_single_document(
+                chunk_store=chunk_store,
+                tenant_id=tenant_id, agent_id=agent_id,
+                document_id=document["id"],
+                source_type="website",
+                source_name=page.url or str(document.get("source_url") or ""),
+                text=page_input,
+                category=page_category,
+            )
 
         updated = await store.update_document(
-            document["id"],
-            agent_id,
-            tenant_id,
+            document["id"], agent_id, tenant_id,
             file_name=pages[0].title.strip() or str(document.get("source_url") or ""),
             source_url=str(document.get("source_url") or ""),
         )
-
-        crawl_job_store.update(
-            job_id,
-            status="completed",
-            stage="completed",
-            discovered_pages=1,
-            indexed_pages=1,
-            current_url=crawled_page.url,
-            message="Crawled and indexed 1 page.",
-            document_id=updated["id"],
-            document_name=updated["file_name"],
+        await crawl_job_store.update(
+            job_id, status="completed", stage="completed",
+            discovered_pages=1, indexed_pages=1,
+            current_url=crawled_page.url, message="Crawled and indexed 1 page.",
+            document_id=updated["id"], document_name=updated["file_name"],
             source_type="website_page",
         )
     except Exception as exc:
-        crawl_job_store.update(
-            job_id,
-            status="failed",
-            stage="failed",
-            error=str(exc),
-            message=str(exc),
-            source_type="website_page",
+        await crawl_job_store.update(
+            job_id, status="failed", stage="failed",
+            error=str(exc), message=str(exc), source_type="website_page",
         )
-
 
 @app.post("/crawl-website", response_model=_CrawlJobResponse, status_code=202)
 async def crawl_website(
@@ -494,8 +463,8 @@ async def crawl_website(
         status="indexing",
     )
 
-    job = crawl_job_store.create(agent_id=request.agent_id, source_url=url)
-    crawl_job_store.update(
+    job = await crawl_job_store.create(agent_id=request.agent_id, source_url=url)
+    await crawl_job_store.update(
         job.id,
         message="Queued for crawling.",
         current_url=url,
@@ -503,7 +472,8 @@ async def crawl_website(
         document_name=document["file_name"],
     )
     background_tasks.add_task(_run_crawl, job.id, request.agent_id, tenant_id, user.id, url)
-    return _CrawlJobResponse(**crawl_job_store.get(job.id).to_dict())
+    refreshed = await crawl_job_store.get(job.id)
+    return _CrawlJobResponse(**refreshed.to_dict())
 
 
 @app.post("/crawl-website-page", response_model=_CrawlJobResponse, status_code=202)
@@ -537,8 +507,8 @@ async def crawl_website_page(
     if document.get("source_type") != "website":
         raise HTTPException(status_code=400, detail="This document is not a website source.")
 
-    job = crawl_job_store.create(agent_id=request.agent_id, source_url=url)
-    crawl_job_store.update(
+    job = await crawl_job_store.create(agent_id=request.agent_id, source_url=url)
+    await crawl_job_store.update(
         job.id,
         message="Queued for page crawl.",
         current_url=url,
@@ -556,7 +526,8 @@ async def crawl_website_page(
         request.document_id,
         url,
     )
-    return _CrawlJobResponse(**crawl_job_store.get(job.id).to_dict())
+    refreshed = await crawl_job_store.get(job.id)
+    return _CrawlJobResponse(**refreshed.to_dict())
 
 
 @app.get("/crawl-website/{job_id}", response_model=_CrawlJobResponse)
@@ -570,7 +541,7 @@ async def get_crawl_job(
     if store is None:
         raise HTTPException(status_code=503, detail="Store is not ready.")
 
-    job = crawl_job_store.get(job_id)
+    job = await crawl_job_store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
 
