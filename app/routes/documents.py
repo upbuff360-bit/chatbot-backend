@@ -308,20 +308,39 @@ async def crawl_website(
         website_service.save_crawl(crawl_result)
 
         crawled_docs = crawl_result.pages
-        combined_text = "\n\n".join(p.text for p in crawled_docs if p.text.strip())
-        if not combined_text.strip():
+        valid_pages = [p for p in crawled_docs if p.text.strip()]
+        if not valid_pages:
             raise ValueError("No text could be extracted from the website.")
 
         pipeline = _build_pipeline(store, agent_id)
-        await pipeline.ingest_single_document(
-            chunk_store=cs,
-            tenant_id=tenant_id,
-            agent_id=agent_id,
-            document_id=doc["id"],
-            source_type="website",
-            source_name=url,
-            text=combined_text,
-        )
+
+        # Ingest each crawled page as a separate document so every page
+        # gets its own focused embeddings — fixes partial product retrieval.
+        for page in valid_pages:
+            page_text = "\n\n".join(filter(None, [
+                page.title.strip() if page.title else "",
+                page.url.strip(),
+                page.text.strip(),
+            ]))
+            page_doc = await store.mark_document_uploaded(
+                agent_id, tenant_id, user.id,
+                page.title or page.url, "website",
+                status="indexing", source_url=page.url,
+            )
+            await pipeline.ingest_single_document(
+                chunk_store=cs,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                document_id=page_doc["id"],
+                source_type="website",
+                source_name=page.url,
+                text=page_text,
+            )
+            await store.mark_document_uploaded(
+                agent_id, tenant_id, user.id,
+                page.title or page.url, "website",
+                status="indexed", source_url=page.url,
+            )
 
     except Exception as exc:
         await store.mark_document_uploaded(
@@ -329,6 +348,7 @@ async def crawl_website(
         )
         raise HTTPException(status_code=500, detail=f"Crawl failed: {exc}") from exc
 
+    # Mark the root crawl entry (the submitted URL) as indexed
     await store.mark_document_uploaded(
         agent_id, tenant_id, user.id, url, "website",
         status="indexed", source_url=url,
