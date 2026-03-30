@@ -11,9 +11,4 @@ python-jose[cryptography]>=3.3.0,<4.0.0
 passlib[bcrypt]>=1.7.4,<2.0.0
 bcrypt>=4.0.0,<4.1.0
 nltk>=3.8.0,<4.0.0
-<<<<<<< HEAD
 tiktoken>=0.7.0,<1.0.0
-=======
-tiktoken>=0.7.0,<1.0.0
-playwright>=1.44.0,<2.0.0
->>>>>>> 25b097e4443390725fdf6e4b1d75b1d224961100
