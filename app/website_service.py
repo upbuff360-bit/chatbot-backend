@@ -328,8 +328,7 @@ class WebsiteService:
         start_url: str,
         progress_callback: Callable[[dict[str, int | str | None]], None] | None = None,
     ) -> list[CrawledPage]:
-        # FIX 4: use canonical origin (strips www.) so that links between
-        # www.mosil.com and mosil.com are treated as the same site.
+
         origin = self._canonical_origin(start_url)
         queue = [start_url]
         seen: set[str] = set()
@@ -351,10 +350,14 @@ class WebsiteService:
             seen.add(current)
 
             try:
-                # FIX 1b: _fetch_page routes through Playwright when CRAWL_USE_JS=true.
-                # FIX 4: final_url is the real URL after HTTP redirects — used as the
-                #        base for urljoin so relative links resolve to the canonical domain.
-                html, content_type, final_url = self._fetch_page(current)
+                result = self._fetch_page(current)
+
+                if len(result) == 4:
+                    html, content_type, final_url, js_links = result
+                else:
+                    html, content_type, final_url = result
+                    js_links = []
+
             except Exception as exc:
                 logger.debug("Failed to fetch %s: %s", current, exc)
                 continue
@@ -365,24 +368,18 @@ class WebsiteService:
             extractor = _HTMLContentParser()
             extractor.feed(html)
             text = self._clean_text(extractor.text())
+
             if text:
-                # Use final_url as the canonical page URL (post-redirect).
                 title = extractor.title or final_url
                 pages.append(CrawledPage(url=final_url, title=title, text=text))
-                discovered_pages = max(len(seen) + len(queue), len(pages))
-                self._notify_progress(
-                    progress_callback,
-                    stage="crawling",
-                    discovered_pages=min(discovered_pages, self.max_pages),
-                    indexed_pages=len(pages),
-                    current_url=final_url,
-                    message=f"Crawled {len(pages)} pages so far.",
-                )
 
-            # FIX 4: resolve links relative to final_url (post-redirect base),
-            #        and use _canonical_origin for the same-domain check so that
-            #        www/non-www variants are treated as the same origin.
-            for link in extractor.links:
+            # ✅ FIXED LINK HANDLING
+            links_to_use = js_links if js_links else extractor.links
+
+            # 🔥 Deduplicate
+            links_to_use = list(set(links_to_use))
+
+            for link in links_to_use:
                 absolute = self._normalize_link(final_url, link)
                 if not absolute:
                     continue
@@ -393,6 +390,57 @@ class WebsiteService:
 
         return pages
 
+    def _fetch_with_js(self, url: str):
+        if not PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError(
+                "Playwright is not installed. Run: pip install playwright && playwright install chromium"
+            )
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--single-process",
+                ],
+            )
+
+            try:
+                page = browser.new_page(user_agent=USER_AGENT)
+
+                page.goto(
+                    url,
+                    wait_until="networkidle",
+                    timeout=int(self.request_timeout * 1000),
+                )
+
+                # 🔥 REQUIRED for Next.js
+                page.wait_for_timeout(2000)
+
+                html = page.content()
+                final_url = page.url
+
+                # ✅ CORRECT VERSION
+                links = page.eval_on_selector_all(
+                    "a",
+                    """elements => elements
+                        .map(el => el.getAttribute('href'))
+                        .filter(href => href &&
+                            !href.startsWith('#') &&
+                            !href.startsWith('javascript') &&
+                            !href.startsWith('mailto') &&
+                            !href.startsWith('tel')
+                        )
+                    """
+                )
+
+            finally:
+                browser.close()
+
+        return html, "text/html", final_url, links
+    
     def _parse_html_page(self, url: str, html: str) -> CrawledPage | None:
         extractor = _HTMLContentParser()
         extractor.feed(html)
@@ -415,48 +463,7 @@ class WebsiteService:
             final_url = response.geturl()
             return raw.decode(charset, errors="ignore"), content_type, final_url
 
-    def _fetch_with_js(self, url: str) -> tuple[str, str, str]:
-        """Fetch URL using Playwright to execute JavaScript.
-        Required for Next.js App Router / SPA sites whose sub-pages return
-        empty HTML shells without JS execution.
-        Returns (html, content_type, final_url).
-        """
-        if not PLAYWRIGHT_AVAILABLE:
-            raise RuntimeError(
-                "Playwright is not installed. Run: pip install playwright && playwright install chromium"
-            )
-        with sync_playwright() as pw:
-            # --no-sandbox and --disable-setuid-sandbox are REQUIRED on
-            # Google Cloud Run (and any container runtime like Docker) because
-            # the outer container already provides isolation — Chrome's own
-            # sandbox cannot create a nested namespace and crashes without these flags.
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",   # /dev/shm is only 64 MB on Cloud Run; use /tmp instead
-                    "--disable-gpu",              # no GPU in Cloud Run
-                    "--single-process",           # reduces memory footprint in constrained environments
-                ],
-            )
-            try:
-                page = browser.new_page(user_agent=USER_AGENT)
-                page.goto(
-                    url,
-                    wait_until="networkidle",
-                    timeout=int(self.request_timeout * 1000),
-                )
-                html = page.content()
-                final_url = page.url  # FIX 4: real URL after redirect
-            finally:
-                browser.close()
-        return html, "text/html", final_url
-
-    def _fetch_page(self, url: str) -> tuple[str, str, str]:
-        """Route fetch through Playwright when JS rendering is enabled,
-        otherwise use plain urllib. Always returns (html, content_type, final_url).
-        """
+    def _fetch_page(self, url: str):
         if self.use_js_rendering and PLAYWRIGHT_AVAILABLE:
             return self._fetch_with_js(url)
         return self._fetch(url)
