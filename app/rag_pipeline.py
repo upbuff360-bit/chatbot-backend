@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generator
 
 from openai import OpenAI
 
@@ -13,7 +13,7 @@ from app.chunking import chunk_text
 from app.embedding_service import EmbeddingService
 from app.manual_knowledge_service import ManualKnowledgeService
 from app.pdf_service import PDFService
-from app.prompt_builder import build_messages, expand_query, is_comparison_question
+from app.prompt_builder import build_messages, expand_query, is_comparison_question, is_list_question
 from app.vector_store import VectorStore
 from app.website_service import WebsiteService
 
@@ -21,6 +21,27 @@ if TYPE_CHECKING:
     from app.services.chunk_store import ChunkStore
 
 FALLBACK_ANSWER = "I don't have enough information to answer that."
+
+# Phrases that indicate a fallback response — used for reliable fallback detection
+# (Enhancement 8: broader than the previous hardcoded startswith check in chat.py)
+FALLBACK_PHRASES = frozenset([
+    "i don't have enough information",
+    "i don't have details on that",
+    "i don't have information",
+    "i'm not sure about that",
+    "i don't know",
+    "that's outside my knowledge",
+    "i cannot find",
+    "i can't find",
+    "no information available",
+    "hmm, i don't",
+])
+
+
+def is_fallback_response(text: str) -> bool:
+    """Return True if the response text indicates the bot couldn't answer."""
+    lower = text.strip().lower()
+    return any(phrase in lower for phrase in FALLBACK_PHRASES)
 
 
 @dataclass(slots=True)
@@ -54,7 +75,7 @@ class RAGPipeline:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.llm_client = OpenAI(api_key=api_key) if api_key else None
 
-    # ── Ingestion ─────────────────────────────────────────────────────────────
+    # ── Ingestion ──────────────────────────────────────────────────────────────
 
     async def ingest_single_document(
         self,
@@ -78,7 +99,6 @@ class RAGPipeline:
         if not chunks:
             return 0
 
-        # 1. Save text chunks to MongoDB → get stable IDs
         chunk_ids = await chunk_store.save_chunks(
             tenant_id=tenant_id,
             agent_id=agent_id,
@@ -88,10 +108,8 @@ class RAGPipeline:
             chunks=chunks,
         )
 
-        # 2. Embed chunks
         embeddings = self.embedding_service.embed_texts(chunks)
 
-        # 3. Store vectors in Qdrant (chunk_id in payload, no text)
         self.vector_store.initialize_collection(recreate=False)
         self.vector_store.upsert_chunks(
             chunks=chunks,
@@ -144,7 +162,6 @@ class RAGPipeline:
             return IngestionStats(documents_loaded=len(documents), chunks_indexed=0)
 
         embeddings = self.embedding_service.embed_texts(all_chunks)
-        # Legacy: no chunk_ids, stores text in Qdrant payload
         self.vector_store.upsert_chunks(all_chunks, embeddings, source_files)
         return IngestionStats(documents_loaded=len(documents), chunks_indexed=len(all_chunks))
 
@@ -154,23 +171,34 @@ class RAGPipeline:
         else:
             self.ingest_documents(recreate=True)
 
-    # ── Vector search (sync, runs in executor) ────────────────────────────────
+    # ── Vector search ──────────────────────────────────────────────────────────
 
     def search_chunks(self, question: str) -> tuple[list[str], list[dict]]:
         """
         Run vector search and return:
         - new_style_ids: chunk IDs to fetch from MongoDB
         - legacy_matches: chunks with text already in Qdrant payload (old data)
+
+        Enhancement 5: passes llm_client to expand_query so LLM rewrites are
+        used when synonym expansion produces fewer than 2 variants.
         """
         if not self.vector_store.collection_exists():
             return [], []
 
-        query_variants = expand_query(question)
+        # Enhancement 5: LLM-assisted query expansion
+        query_variants = expand_query(question, llm_client=self.llm_client)
         all_matches: list = []
         seen_ids: set = set()
 
-        retrieval_limit = self.retrieval_limit * 2 if is_comparison_question(question) else self.retrieval_limit
-        threshold = max(self.similarity_threshold - 0.05, 0.08) if is_comparison_question(question) else self.similarity_threshold
+        if is_comparison_question(question):
+            retrieval_limit = self.retrieval_limit * 2
+            threshold = max(self.similarity_threshold - 0.05, 0.08)
+        elif is_list_question(question):
+            retrieval_limit = self.retrieval_limit * 3
+            threshold = max(self.similarity_threshold - 0.07, 0.06)
+        else:
+            retrieval_limit = self.retrieval_limit
+            threshold = self.similarity_threshold
 
         for variant in query_variants:
             variant_embedding = self.embedding_service.embed_query(variant)
@@ -202,7 +230,6 @@ class RAGPipeline:
         if not all_matches:
             all_matches = self._keyword_matches(question)
 
-        # Separate new-style vs legacy
         new_style_ids: list[str] = []
         legacy_matches: list[dict] = []
 
@@ -211,7 +238,6 @@ class RAGPipeline:
             if "chunk_id" in payload:
                 new_style_ids.append(payload["chunk_id"])
             else:
-                # Legacy: text stored in Qdrant payload
                 chunk = str(payload.get("chunk", "")).strip()
                 source_file = str(payload.get("source_file", "unknown"))
                 source_url  = str(payload.get("source_url", "")).strip()
@@ -223,7 +249,7 @@ class RAGPipeline:
 
         return new_style_ids, legacy_matches
 
-    # ── Answer (pure sync, no async calls) ───────────────────────────────────
+    # ── Answer (sync, non-streaming) ───────────────────────────────────────────
 
     def answer_question(
         self,
@@ -231,15 +257,94 @@ class RAGPipeline:
         system_prompt: str | None = None,
         temperature: float = 0.2,
         conversation_history: list[dict[str, str]] | None = None,
-        prefetched_context: list[dict] | None = None,  # pre-fetched from MongoDB async
+        prefetched_context: list[dict] | None = None,
     ) -> str:
         """
-        Answer using pre-fetched context.
+        Return a complete answer string (non-streaming).
         MongoDB fetching is done BEFORE calling this method (in the async route).
-        This method is purely sync — safe to run in thread executor.
         """
         self._ensure_ready()
 
+        context_parts, source_urls = self._build_context_parts(prefetched_context)
+
+        # Enhancement 8: flag fallback BEFORE the LLM call so detection is 100% accurate
+        if not context_parts:
+            return FALLBACK_ANSWER
+
+        messages = build_messages(
+            context="\n\n".join(context_parts),
+            question=question,
+            system_prompt=system_prompt,
+            conversation_history=conversation_history,
+            source_urls=source_urls,
+        )
+        response = self.llm_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            # Enhancement (prev session): raised cap from 0.1 → 0.7 so the LLM
+            # can phrase answers naturally instead of always picking the single
+            # most probable token.
+            temperature=min(temperature, 0.7),
+        )
+        return (response.choices[0].message.content or FALLBACK_ANSWER).strip()
+
+    # ── Enhancement 3: Streaming answer ───────────────────────────────────────
+
+    def stream_answer_question(
+        self,
+        question: str,
+        system_prompt: str | None = None,
+        temperature: float = 0.2,
+        conversation_history: list[dict[str, str]] | None = None,
+        prefetched_context: list[dict] | None = None,
+    ) -> Generator[str, None, None]:
+        """
+        Yield answer tokens as they arrive from OpenAI (Server-Sent Events).
+        The caller (FastAPI StreamingResponse) iterates this generator and
+        pushes each chunk to the client immediately.
+
+        Usage in a FastAPI route:
+            from fastapi.responses import StreamingResponse
+
+            def event_stream():
+                for token in pipeline.stream_answer_question(...):
+                    yield f"data: {token}\n\n"
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
+        """
+        self._ensure_ready()
+
+        context_parts, source_urls = self._build_context_parts(prefetched_context)
+
+        if not context_parts:
+            yield FALLBACK_ANSWER
+            return
+
+        messages = build_messages(
+            context="\n\n".join(context_parts),
+            question=question,
+            system_prompt=system_prompt,
+            conversation_history=conversation_history,
+            source_urls=source_urls,
+        )
+
+        stream = self.llm_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=min(temperature, 0.7),
+            stream=True,
+        )
+
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                yield delta.content
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _build_context_parts(
+        self, prefetched_context: list[dict] | None
+    ) -> tuple[list[str], list[str]]:
+        """Deduplicate and format context chunks; return (context_parts, source_urls)."""
         context_parts: list[str] = []
         source_urls: list[str] = []
         seen_urls: set[str] = set()
@@ -255,24 +360,7 @@ class RAGPipeline:
                 seen_urls.add(source_name)
                 source_urls.append(source_name)
 
-        if not context_parts:
-            return FALLBACK_ANSWER
-
-        messages = build_messages(
-            context="\n\n".join(context_parts),
-            question=question,
-            system_prompt=system_prompt,
-            conversation_history=conversation_history,
-            source_urls=source_urls,
-        )
-        response = self.llm_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=min(temperature, 0.1),
-        )
-        return (response.choices[0].message.content or FALLBACK_ANSWER).strip()
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        return context_parts, source_urls
 
     def _ensure_ready(self) -> None:
         if not self.embedding_service.is_configured() or self.llm_client is None:
