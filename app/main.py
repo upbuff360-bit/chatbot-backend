@@ -89,7 +89,7 @@ async def _startup_index_agents(s: AdminStoreMongo, cs: ChunkStore) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global store, chunk_store
+    global store, chunk_store, crawl_job_store
 
     await connect()
     await create_indexes()
