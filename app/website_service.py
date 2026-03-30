@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from collections.abc import Callable
@@ -13,13 +12,6 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 import xml.etree.ElementTree as ET
 
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
 
 USER_AGENT = (
     "Mozilla/5.0 (compatible; ChatbotKnowledgeCrawler/1.0; +https://localhost)"
@@ -70,9 +62,6 @@ class WebsiteService:
         self.website_directory = Path(website_directory)
         self.max_pages = int(os.getenv("MAX_CRAWL_PAGES", "200"))
         self.request_timeout = float(os.getenv("CRAWL_TIMEOUT_SECONDS", "20"))
-        # Set CRAWL_USE_JS=true in .env to enable Playwright JS rendering.
-        # Required for Next.js App Router / SPA sites like mosil.com.
-        self.use_js_rendering = os.getenv("CRAWL_USE_JS", "false").lower() == "true" 
 
     def load_documents(self) -> list[WebsiteDocument]:
         if not self.website_directory.exists():
@@ -140,7 +129,7 @@ class WebsiteService:
         progress_callback: Callable[[dict[str, int | str | None]], None] | None = None,
     ) -> CrawledWebsite:
         normalized_url = self._normalize_url(source_url)
-        content, content_type, _ = self._fetch(normalized_url)
+        content, content_type = self._fetch(normalized_url)
 
         if self._looks_like_sitemap(normalized_url, content_type, content):
             pages = self._crawl_sitemap(normalized_url, content, progress_callback=progress_callback)
@@ -218,7 +207,7 @@ class WebsiteService:
 
     def crawl_single_page(self, url: str) -> CrawledPage:
         normalized_url = self._normalize_url(url)
-        html, content_type, _ = self._fetch(normalized_url)
+        html, content_type = self._fetch(normalized_url)
         if "html" not in content_type.lower() and "<html" not in html.lower():
             raise ValueError("The provided URL does not appear to contain readable HTML content.")
 
@@ -271,16 +260,14 @@ class WebsiteService:
     ) -> list[CrawledPage]:
         sitemap_url = self._discover_sitemap_url(start_url)
         if sitemap_url:
-            # FIX 2: log failures instead of silently swallowing all exceptions.
             try:
-                raw_xml, content_type, _ = self._fetch(sitemap_url)
+                raw_xml, content_type = self._fetch(sitemap_url)
                 if self._looks_like_sitemap(sitemap_url, content_type, raw_xml):
                     pages = self._crawl_sitemap(sitemap_url, raw_xml, progress_callback=progress_callback)
                     if pages:
                         return pages
-                    logger.warning("Sitemap at %s parsed but returned 0 crawlable pages", sitemap_url)
-            except Exception as exc:
-                logger.warning("Sitemap crawl failed for %s: %s — falling back to HTML link crawl", sitemap_url, exc)
+            except Exception:
+                pass
 
         return self._crawl_site(start_url, progress_callback=progress_callback)
 
@@ -307,7 +294,7 @@ class WebsiteService:
 
         for url in urls[: self.max_pages]:
             try:
-                html, _, _ = self._fetch(url)
+                html, _ = self._fetch(url)
             except Exception:
                 continue
             page = self._parse_html_page(url, html)
@@ -328,8 +315,7 @@ class WebsiteService:
         start_url: str,
         progress_callback: Callable[[dict[str, int | str | None]], None] | None = None,
     ) -> list[CrawledPage]:
-
-        origin = self._canonical_origin(start_url)
+        origin = urlparse(start_url).netloc
         queue = [start_url]
         seen: set[str] = set()
         pages: list[CrawledPage] = []
@@ -350,16 +336,8 @@ class WebsiteService:
             seen.add(current)
 
             try:
-                result = self._fetch_page(current)
-
-                if len(result) == 4:
-                    html, content_type, final_url, js_links = result
-                else:
-                    html, content_type, final_url = result
-                    js_links = []
-
-            except Exception as exc:
-                logger.debug("Failed to fetch %s: %s", current, exc)
+                html, content_type = self._fetch(current)
+            except Exception:
                 continue
 
             if "html" not in content_type.lower() and "<html" not in html.lower():
@@ -368,85 +346,31 @@ class WebsiteService:
             extractor = _HTMLContentParser()
             extractor.feed(html)
             text = self._clean_text(extractor.text())
-
             if text:
-                title = extractor.title or final_url
-                pages.append(CrawledPage(url=final_url, title=title, text=text))
+                title = extractor.title or current
+                pages.append(CrawledPage(url=current, title=title, text=text))
+                discovered_pages = max(len(seen) + len(queue), len(pages))
+                self._notify_progress(
+                    progress_callback,
+                    stage="crawling",
+                    discovered_pages=min(discovered_pages, self.max_pages),
+                    indexed_pages=len(pages),
+                    current_url=current,
+                    message=f"Crawled {len(pages)} pages so far.",
+                )
 
-            # ✅ FIXED LINK HANDLING
-            links_to_use = js_links if js_links else extractor.links
-
-            # 🔥 Deduplicate
-            links_to_use = list(set(links_to_use))
-
-            for link in links_to_use:
-                absolute = self._normalize_link(final_url, link)
+            for link in extractor.links:
+                absolute = self._normalize_link(current, link)
                 if not absolute:
                     continue
-                if self._canonical_origin(absolute) != origin:
+                parsed = urlparse(absolute)
+                if parsed.netloc != origin:
                     continue
                 if absolute not in seen and absolute not in queue:
                     queue.append(absolute)
 
         return pages
 
-    def _fetch_with_js(self, url: str):
-        if not PLAYWRIGHT_AVAILABLE:
-            raise RuntimeError(
-                "Playwright is not installed. Run: pip install playwright && playwright install chromium"
-            )
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                ],
-            )
-
-            try:
-                page = browser.new_page(user_agent=USER_AGENT)
-
-                try:
-                    page.goto(
-                        url,
-                        wait_until="domcontentloaded",  # 🔥 safer than networkidle
-                        timeout=15000
-                    )
-                except Exception as e:
-                    print("❌ Page load failed:", url, e)
-                    return "", "text/html", url, []
-
-                # 🔥 REQUIRED for Next.js
-                page.wait_for_timeout(2000)
-
-                html = page.content()
-                final_url = page.url
-
-                # ✅ CORRECT VERSION
-                links = page.eval_on_selector_all(
-                    "a",
-                    """elements => elements
-                        .map(el => el.getAttribute('href'))
-                        .filter(href => href &&
-                            !href.startsWith('#') &&
-                            !href.startsWith('javascript') &&
-                            !href.startsWith('mailto') &&
-                            !href.startsWith('tel')
-                        )
-                    """
-                )
-
-            finally:
-                browser.close()
-
-        return html, "text/html", final_url, links
-    
     def _parse_html_page(self, url: str, html: str) -> CrawledPage | None:
         extractor = _HTMLContentParser()
         extractor.feed(html)
@@ -455,24 +379,13 @@ class WebsiteService:
             return None
         return CrawledPage(url=url, title=extractor.title or url, text=text)
 
-    def _fetch(self, url: str) -> tuple[str, str, str]:
-        """Fetch URL via urllib. Returns (html, content_type, final_url).
-        final_url reflects the real URL after any HTTP redirects (e.g. www → non-www).
-        """
+    def _fetch(self, url: str) -> tuple[str, str]:
         request = Request(url, headers={"User-Agent": USER_AGENT})
         with urlopen(request, timeout=self.request_timeout) as response:
             raw = response.read()
             content_type = response.headers.get("Content-Type", "")
             charset = response.headers.get_content_charset() or "utf-8"
-            # FIX 4: capture the real URL after redirect so link resolution
-            # uses the canonical domain, not the pre-redirect www URL.
-            final_url = response.geturl()
-            return raw.decode(charset, errors="ignore"), content_type, final_url
-
-    def _fetch_page(self, url: str):
-        if self.use_js_rendering and PLAYWRIGHT_AVAILABLE:
-            return self._fetch_with_js(url)
-        return self._fetch(url)
+            return raw.decode(charset, errors="ignore"), content_type
 
     def _extract_sitemap_urls(self, raw_xml: str, source_url: str) -> list[str]:
         try:
@@ -491,7 +404,7 @@ class WebsiteService:
                 if not nested_url:
                     continue
                 try:
-                    nested_xml, _, _ = self._fetch(nested_url)
+                    nested_xml, _ = self._fetch(nested_url)
                 except Exception:
                     continue
                 urls.extend(self._extract_sitemap_urls(nested_xml, nested_url))
@@ -513,10 +426,9 @@ class WebsiteService:
         parsed = urlparse(start_url)
         base = f"{parsed.scheme}://{parsed.netloc}"
 
-        # Check robots.txt first — highest-priority source for Sitemap: directive.
         robots_url = urljoin(base, "/robots.txt")
         try:
-            robots_text, _, _ = self._fetch(robots_url)
+            robots_text, _ = self._fetch(robots_url)
         except Exception:
             robots_text = ""
 
@@ -526,21 +438,14 @@ class WebsiteService:
                 if candidate:
                     return self._normalize_url(candidate)
 
-        # FIX 3: expanded candidates covering standard, next-sitemap v2/v3, and
-        # Sanity / headless CMS patterns that mosil.com-style sites commonly use.
         default_candidates = [
-            "/sitemap.xml",           # standard
-            "/sitemap_index.xml",     # standard index
-            "/sitemap-index.xml",     # alternative spelling
-            "/sitemap-0.xml",         # next-sitemap v3 first shard
-            "/server-sitemap.xml",    # next-sitemap dynamic (SSR) sitemap
-            "/server-sitemap-index.xml",  # next-sitemap dynamic index
-            "/sitemap/0.xml",         # next-sitemap alternative shard path
+            urljoin(base, "/sitemap.xml"),
+            urljoin(base, "/sitemap_index.xml"),
+            urljoin(base, "/sitemap-index.xml"),
         ]
-        for path in default_candidates:
-            candidate = urljoin(base, path)
+        for candidate in default_candidates:
             try:
-                raw_xml, content_type, _ = self._fetch(candidate)
+                raw_xml, content_type = self._fetch(candidate)
             except Exception:
                 continue
             if self._looks_like_sitemap(candidate, content_type, raw_xml):
@@ -640,16 +545,6 @@ class WebsiteService:
             return True
         snippet = content.lstrip()[:200].lower()
         return snippet.startswith("<?xml") or "<urlset" in snippet or "<sitemapindex" in snippet
-
-    @staticmethod
-    def _canonical_origin(url: str) -> str:
-        """Return the bare domain, stripping www. prefix, for same-origin comparison.
-        Treats www.mosil.com and mosil.com as the same origin (FIX 4).
-        """
-        netloc = urlparse(url).netloc.lower()
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-        return netloc
 
     @staticmethod
     def _normalize_url(url: str) -> str:
