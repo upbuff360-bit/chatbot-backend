@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from threading import Lock
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
+
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass(slots=True)
@@ -25,13 +30,32 @@ class CrawlJob:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "CrawlJob":
+        d = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        return cls(**d)
+
 
 class CrawlJobStore:
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._jobs: dict[str, CrawlJob] = {}
+    """
+    MongoDB-backed crawl job store.
+    Jobs survive server restarts and --reload hot-reloads.
+    TTL index auto-purges completed/failed jobs after 24 hours.
+    """
 
-    def create(self, agent_id: str, source_url: str) -> CrawlJob:
+    def __init__(self, db: AsyncIOMotorDatabase) -> None:
+        self._col = db["crawl_jobs"]
+
+    async def ensure_indexes(self) -> None:
+        await self._col.create_index("agent_id")
+        # Auto-delete jobs older than 24 hours
+        await self._col.create_index(
+            "created_at",
+            expireAfterSeconds=86400,
+        )
+
+    async def create(self, agent_id: str, source_url: str) -> CrawlJob:
+        from uuid import uuid4
         job = CrawlJob(
             id=str(uuid4()),
             agent_id=agent_id,
@@ -40,17 +64,25 @@ class CrawlJobStore:
             stage="queued",
             message="Waiting to start crawl.",
         )
-        with self._lock:
-            self._jobs[job.id] = job
+        doc = job.to_dict()
+        doc["_id"] = doc.pop("id")
+        doc["created_at"] = _now()
+        await self._col.insert_one(doc)
         return job
 
-    def get(self, job_id: str) -> CrawlJob | None:
-        with self._lock:
-            return self._jobs.get(job_id)
+    async def get(self, job_id: str) -> CrawlJob | None:
+        doc = await self._col.find_one({"_id": job_id})
+        if doc is None:
+            return None
+        doc["id"] = doc.pop("_id")
+        doc.pop("created_at", None)
+        return CrawlJob.from_dict(doc)
 
-    def update(self, job_id: str, **changes: Any) -> CrawlJob:
-        with self._lock:
-            job = self._jobs[job_id]
-            for key, value in changes.items():
-                setattr(job, key, value)
-            return job
+    async def update(self, job_id: str, **changes: Any) -> CrawlJob | None:
+        if not changes:
+            return await self.get(job_id)
+        await self._col.update_one(
+            {"_id": job_id},
+            {"$set": changes},
+        )
+        return await self.get(job_id)
