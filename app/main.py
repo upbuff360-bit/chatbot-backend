@@ -5,6 +5,11 @@ import logging
 import os
 from datetime import datetime, timezone, timedelta
 
+# Configure root logger to output to stdout so Cloud Run captures it
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 from contextlib import asynccontextmanager
 
