@@ -119,6 +119,10 @@ async def lifespan(_: FastAPI):
     # Smart startup indexing
     await _startup_index_agents(store, chunk_store)
 
+    # Signal that all services are fully initialised.
+    # Any background task waiting on _services_ready_event will now proceed.
+    _services_ready_event.set()
+
     yield
 
     await disconnect()
@@ -203,6 +207,10 @@ class _CrawlJobResponse(_BaseModel):
 
 crawl_job_store: CrawlJobStore | None = None
 recrawl_log_store: RecrawlLogStore | None = None
+
+# Event set at the end of lifespan startup — background tasks that need
+# fully-initialized services wait on this instead of polling globals.
+_services_ready_event: asyncio.Event = asyncio.Event()
 
 
 def _normalize_url(url: str) -> str:
@@ -870,16 +878,14 @@ async def _run_scheduled_recrawl() -> None:
     from app.services.email_service import EmailConfigError, _send_email_sync
     from app.website_service import WebsiteService
 
-    # Wait up to 60 seconds for services to finish initialising.
-    # Cloud Run may trigger the scheduler at the exact moment the instance
-    # is still running its lifespan startup (DB connect, index rebuild etc.)
-    for _attempt in range(60):
-        if store is not None and chunk_store is not None and recrawl_log_store is not None:
-            break
-        logger.info("Scheduled recrawl: waiting for services to be ready (%d/60)…", _attempt + 1)
-        await asyncio.sleep(1)
-    else:
-        logger.error("Scheduled recrawl: services not ready after 60s — aborting.")
+    # Wait for lifespan startup to complete before doing anything.
+    # Cloud Run may invoke the scheduler endpoint while the instance is
+    # still running startup indexing — the Event is set only after all
+    # services are fully initialised so we never read None globals.
+    try:
+        await asyncio.wait_for(_services_ready_event.wait(), timeout=120)
+    except asyncio.TimeoutError:
+        logger.error("Scheduled recrawl: services did not become ready within 120s — aborting.")
         return
 
     now = datetime.now(timezone.utc)
