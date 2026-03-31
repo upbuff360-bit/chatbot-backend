@@ -936,6 +936,9 @@ async def _run_scheduled_recrawl() -> None:
                 agent_updated = datetime.fromisoformat(agent_updated.replace("Z", "+00:00"))
             except Exception:
                 agent_updated = None
+        # MongoDB returns naive datetimes — make them UTC-aware for comparison
+        if isinstance(agent_updated, datetime) and agent_updated.tzinfo is None:
+            agent_updated = agent_updated.replace(tzinfo=timezone.utc)
 
         is_active = (
             agent_updated is not None
@@ -953,7 +956,8 @@ async def _run_scheduled_recrawl() -> None:
             parsed = []
             for t in crawl_times:
                 if isinstance(t, datetime):
-                    parsed.append(t)
+                    # Make naive datetimes UTC-aware
+                    parsed.append(t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t)
                 elif isinstance(t, str):
                     try:
                         parsed.append(datetime.fromisoformat(t.replace("Z", "+00:00")))
