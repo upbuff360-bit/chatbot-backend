@@ -658,18 +658,46 @@ class WebsiteService:
         return WebsitePageRecord(index=len(pages) - 1, **record)
 
     def crawl_single_page(self, url: str) -> CrawledPage:
+        """
+        Fetch and parse exactly ONE page.
+
+        Strategy:
+          1. Try plain urllib first (fast, no browser needed).
+          2. If the page is empty/JS-rendered and Playwright is available,
+             fall back to a headless browser render of just that one URL.
+        """
         normalized_url = self._normalize_url(url)
-        html, content_type = self._fetch(normalized_url)
-        if "html" not in content_type.lower() and "<html" not in html.lower():
-            raise ValueError(
-                "The provided URL does not appear to contain readable HTML content."
+
+        # ── Try plain HTTP first ──────────────────────────────────────────
+        try:
+            html, content_type = self._fetch(normalized_url)
+            if "html" in content_type.lower() or "<html" in html.lower():
+                page = self._parse_html_page(normalized_url, html)
+                if page is not None and len(page.text.strip()) > 200:
+                    return page
+        except Exception:
+            html = ""
+
+        # ── Fallback to Playwright for JS-heavy pages ─────────────────────
+        if _PLAYWRIGHT_AVAILABLE:
+            logger.debug(
+                "Plain fetch returned thin content for %s — "
+                "trying Playwright single-page render.",
+                normalized_url,
             )
-        page = self._parse_html_page(normalized_url, html)
-        if page is None:
-            raise ValueError(
-                "No readable page content was found at the provided URL."
-            )
-        return page
+            pages = self._crawl_site_puppeteer(normalized_url)
+            if pages:
+                return pages[0]
+
+        # ── Final fallback: return whatever urllib got ─────────────────────
+        if html:
+            page = self._parse_html_page(normalized_url, html)
+            if page is not None:
+                return page
+
+        raise ValueError(
+            "No readable page content was found at the provided URL."
+        )
 
     def update_source_page(
         self,

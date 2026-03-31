@@ -27,13 +27,21 @@ class VectorStore:
         if recreate and self._collection_exists():
             self.client.delete_collection(collection_name=self.collection_name)
         if not self._collection_exists():
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=models.VectorParams(
-                    size=self.vector_size,
-                    distance=self.distance,
-                ),
-            )
+            try:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=models.VectorParams(
+                        size=self.vector_size,
+                        distance=self.distance,
+                    ),
+                )
+            except Exception as exc:
+                # 409 Conflict means collection was created between the exists-check
+                # and the create call (race condition). Safe to ignore.
+                if "already exists" in str(exc).lower() or "409" in str(exc):
+                    pass
+                else:
+                    raise
 
     def upsert_chunks(
         self,
