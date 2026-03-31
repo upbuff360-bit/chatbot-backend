@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 from contextlib import asynccontextmanager
@@ -872,7 +873,6 @@ async def _run_scheduled_recrawl() -> None:
     """
     global store, chunk_store, recrawl_log_store
 
-    from datetime import timedelta
     from app.category_detector import detect_page_category
     from app.rag_pipeline import RAGPipeline
     from app.services.email_service import EmailConfigError, _send_email_sync
