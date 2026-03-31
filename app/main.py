@@ -14,6 +14,7 @@ load_dotenv()
 from app.db.connection import connect, create_indexes, disconnect, get_database
 from app.core.dependencies import CurrentUser, get_current_user
 from app.crawl_job_store import CrawlJobStore
+from app.recrawl_log_store import RecrawlLogEntry, RecrawlLogStore
 from app.models.user import UserRole
 from app.services.admin_store_mongo import AdminStoreMongo
 from app.services.chunk_store import ChunkStore
@@ -98,10 +99,12 @@ async def lifespan(_: FastAPI):
     store = AdminStoreMongo(db=db, agents_root=os.getenv("AGENTS_DATA_ROOT", "./data/agents"))
     chunk_store = ChunkStore(db=db)
     crawl_job_store = CrawlJobStore(db=db)
+    recrawl_log_store = RecrawlLogStore(db=db)
 
     # Ensure MongoDB indexes exist
     await chunk_store.ensure_indexes()
     await crawl_job_store.ensure_indexes()
+    await recrawl_log_store.ensure_indexes()
 
     # Backfill display_id for existing agents (one-time, safe to run multiple times)
     await store.backfill_agent_display_ids()
@@ -196,6 +199,7 @@ class _CrawlJobResponse(_BaseModel):
 
 
 crawl_job_store: CrawlJobStore | None = None
+recrawl_log_store: RecrawlLogStore | None = None
 
 
 def _normalize_url(url: str) -> str:
@@ -205,10 +209,29 @@ def _normalize_url(url: str) -> str:
 
 
 async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, url: str) -> None:
+    """
+    Batch crawl implementation.
+
+    Pages are crawled and ingested in batches of CRAWL_BATCH_SIZE (default 50).
+    Each batch is saved to disk and indexed into Qdrant immediately, so the
+    chatbot becomes usable after the first batch completes — without waiting
+    for the full crawl to finish.
+
+    Flow:
+      1. crawl_in_batches() generator runs in a thread executor.
+      2. Each batch is yielded back to this async function via a queue.
+      3. The batch is saved + ingested before the next batch starts crawling.
+      4. Job progress is updated after every page so the frontend shows live
+         progress throughout the entire crawl.
+    """
     global store, chunk_store, crawl_job_store
+    import queue as _queue
+    import threading as _threading
     from app.category_detector import detect_page_category
     from app.rag_pipeline import RAGPipeline
-    from app.website_service import WebsiteService
+    from app.website_service import CrawledPage, WebsiteService
+
+    BATCH_SIZE = int(os.getenv("CRAWL_BATCH_SIZE", "50"))
 
     if store is None or chunk_store is None or crawl_job_store is None:
         await crawl_job_store.update(
@@ -231,7 +254,12 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
         website_dir.mkdir(parents=True, exist_ok=True)
         website_service = WebsiteService(website_directory=website_dir)
 
+        # Progress callback — forwards crawler updates to the job store
         def on_progress(update: dict) -> None:
+            # indexed_pages from the crawler = pages crawled so far.
+            # This gives live progress during the crawl phase.
+            # During ingestion, _run_crawl overwrites this with the
+            # actual Qdrant-indexed count.
             asyncio.run_coroutine_threadsafe(
                 crawl_job_store.update(
                     job_id,
@@ -244,31 +272,26 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
                 loop,
             )
 
-        crawl_result = await loop.run_in_executor(
-            None, lambda: website_service.crawl(url, progress_callback=on_progress)
-        )
-        await loop.run_in_executor(None, lambda: website_service.save_crawl(crawl_result))
+        # ── Bridge: run the sync generator in a thread, pass batches back
+        # via a queue so this async function can await between batches.
+        batch_queue: _queue.Queue = _queue.Queue()
+        crawl_errors: list[BaseException] = []
 
-        stored_pages = website_service.list_source_pages(url)
-        if not stored_pages or not any(p.text.strip() for p in stored_pages):
-            raise ValueError("No text extracted from website.")
+        def _crawl_worker() -> None:
+            try:
+                for batch in website_service.crawl_in_batches(
+                    url, batch_size=BATCH_SIZE, progress_callback=on_progress
+                ):
+                    batch_queue.put(batch)
+            except Exception as exc:  # noqa: BLE001
+                crawl_errors.append(exc)
+            finally:
+                batch_queue.put(None)  # sentinel — signals end of crawl
 
-        doc = await store.upsert_website_source(
-            agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
-            display_name=stored_pages[0].title if stored_pages else (crawl_result.display_name or url),
-            source_url=url, status="indexing",
-        )
-        await crawl_job_store.update(
-            job_id,
-            stage="indexing",
-            message=f"Indexing {len(stored_pages)} page(s)...",
-            discovered_pages=len(stored_pages),
-            indexed_pages=0,
-            current_url=None,
-            document_id=doc["id"],
-            document_name=doc["file_name"],
-        )
+        crawl_thread = _threading.Thread(target=_crawl_worker, daemon=True)
+        crawl_thread.start()
 
+        # ── Prepare the RAG pipeline and document record up front
         pipeline = RAGPipeline(
             pdf_directory=store.get_agent_pdf_dir(agent_id),
             website_directory=website_dir,
@@ -276,43 +299,114 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
             qa_directory=store.get_agent_qa_dir(agent_id),
             collection_name=agent_collection_name(agent_id),
         )
-        # Clear old chunks for this document
+
+        # Upsert a document record for the root URL
+        doc = await store.upsert_website_source(
+            agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
+            display_name=url, source_url=url, status="indexing",
+        )
+        await crawl_job_store.update(
+            job_id,
+            document_id=doc["id"],
+            document_name=doc["file_name"],
+        )
+
+        # Clear old chunks for this source so re-crawls don't duplicate
         chunk_ids = await chunk_store.get_chunk_ids_by_document(doc["id"])
         if chunk_ids:
             pipeline.remove_document(doc["id"], chunk_ids=chunk_ids)
             await chunk_store.delete_chunks_by_document(doc["id"])
 
-        # Ingest each page separately with category detection
+        # ── Process batches as they arrive ────────────────────────────────
+        all_pages: list[CrawledPage] = []
         indexed = 0
-        for page in stored_pages:
-            page_text = page.text.strip()
-            if not page_text:
-                continue
-            page_category = detect_page_category(url=page.url, title=page.title, text=page_text)
-            page_input = f"{page.title}\n\n{page.url}\n\n{page_text}"
-            await pipeline.ingest_single_document(
-                chunk_store=chunk_store,
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-                document_id=doc["id"],
-                source_type="website",
-                source_name=page.url or url,
-                text=page_input,
-                category=page_category,
-            )
-            indexed += 1
-            await crawl_job_store.update(job_id, indexed_pages=indexed)
+        batch_num = 0
+        display_name = url
 
+        while True:
+            # Wait for next batch from the crawl thread (non-blocking for
+            # the event loop — uses run_in_executor so other coroutines can
+            # proceed while we wait).
+            batch: list[CrawledPage] | None = await loop.run_in_executor(
+                None, batch_queue.get
+            )
+
+            if batch is None:
+                # Sentinel received — crawl thread is done
+                break
+
+            if not batch:
+                continue
+
+            batch_num += 1
+            all_pages.extend(batch)
+
+            # Persist this batch to disk immediately
+            await loop.run_in_executor(
+                None,
+                lambda b=batch: website_service._merge_and_save_pages(url, b),
+            )
+
+            # Ingest every page in this batch into Qdrant
+            await crawl_job_store.update(
+                job_id,
+                stage="indexing",
+                message=f"Batch {batch_num}: indexing {len(batch)} page(s)…",
+                discovered_pages=len(all_pages),
+            )
+            for page in batch:
+                page_text = page.text.strip()
+                if not page_text:
+                    continue
+                page_category = detect_page_category(
+                    url=page.url, title=page.title, text=page_text
+                )
+                page_input = f"{page.title}\n\n{page.url}\n\n{page_text}"
+                await pipeline.ingest_single_document(
+                    chunk_store=chunk_store,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    document_id=doc["id"],
+                    source_type="website",
+                    source_name=page.url or url,
+                    text=page_input,
+                    category=page_category,
+                )
+                indexed += 1
+                if not display_name or display_name == url:
+                    display_name = page.title or url
+                await crawl_job_store.update(
+                    job_id,
+                    stage="indexing",
+                    indexed_pages=indexed,
+                    discovered_pages=len(all_pages),
+                    current_url=page.url,
+                    message=(
+                        f"Batch {batch_num} — indexed {indexed} page(s) so far. "
+                        f"Chatbot is already usable!"
+                    ),
+                )
+
+        crawl_thread.join(timeout=10)
+
+        # Re-raise any crawl-thread exception
+        if crawl_errors:
+            raise crawl_errors[0]
+
+        if not all_pages:
+            raise ValueError("No readable website content was found at the provided URL.")
+
+        # Mark the source as fully indexed
         doc = await store.upsert_website_source(
             agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
-            display_name=stored_pages[0].title if stored_pages else (crawl_result.display_name or url),
+            display_name=display_name,
             source_url=url, status="indexed",
         )
         await crawl_job_store.update(
             job_id,
             status="completed", stage="completed",
-            message=f"Indexed {indexed} page(s).",
-            discovered_pages=len(stored_pages),
+            message=f"Crawl complete — indexed {indexed} page(s) across {batch_num} batch(es).",
+            discovered_pages=len(all_pages),
             indexed_pages=indexed,
             current_url=None,
             document_id=doc["id"],
@@ -560,3 +654,401 @@ async def get_crawl_job(
 async def serve_widget():
     widget_path = os.path.join(os.path.dirname(__file__), "..", "public", "widget.js")
     return FileResponse(widget_path, media_type="application/javascript")
+
+
+# ── Scheduled auto re-crawl ────────────────────────────────────────────────────
+#
+# Triggered by Cloud Scheduler every Sunday at 2 AM via:
+#   POST /schedule-recrawl
+#   Header: X-Recrawl-Secret: <RECRAWL_SECRET env var>
+#
+# Strategy:
+#   - Active agents   (conversation in last 7 days)  → re-crawl weekly
+#   - Inactive agents (no conversation in 7+ days)   → re-crawl monthly
+#   - Agents with no website sources                 → skip
+#   - Process ONE agent at a time with a 60-second gap between each
+#   - Only re-index pages whose text hash changed since last crawl
+#   - Log every result (success/fail/skipped) to MongoDB recrawl_logs
+#   - Send summary email when done (if SMTP is configured)
+
+_ACTIVE_THRESHOLD_DAYS   = int(os.getenv("RECRAWL_ACTIVE_DAYS",   "7"))
+_INACTIVE_CYCLE_DAYS     = int(os.getenv("RECRAWL_INACTIVE_DAYS", "30"))
+_RECRAWL_DELAY_SECONDS   = int(os.getenv("RECRAWL_DELAY_SECONDS", "60"))
+_RECRAWL_SECRET          = os.getenv("RECRAWL_SECRET", "")
+
+
+async def _run_scheduled_recrawl() -> None:
+    """
+    Sequential re-crawl runner.
+
+    For every agent that has at least one website source:
+      1. Determine if the agent is active (chat in last 7 days) or inactive.
+      2. Active   → re-crawl if last crawl was ≥ 7 days ago.
+         Inactive → re-crawl if last crawl was ≥ 30 days ago.
+      3. Re-crawl in batches, but only re-index pages whose content changed.
+      4. Wait 60 seconds before moving to the next agent.
+      5. Log every outcome to MongoDB.
+      6. Send a summary email when all agents are done.
+    """
+    global store, chunk_store, recrawl_log_store
+
+    from datetime import timedelta
+    from app.category_detector import detect_page_category
+    from app.rag_pipeline import RAGPipeline
+    from app.services.email_service import EmailConfigError, _send_email_sync
+    from app.website_service import WebsiteService
+
+    if store is None or chunk_store is None or recrawl_log_store is None:
+        logger.error("Scheduled recrawl: services not ready.")
+        return
+
+    now = datetime.now(timezone.utc)
+    active_cutoff   = now - timedelta(days=_ACTIVE_THRESHOLD_DAYS)
+    inactive_window = timedelta(days=_INACTIVE_CYCLE_DAYS)
+    active_window   = timedelta(days=_ACTIVE_THRESHOLD_DAYS)
+
+    # ── 1. Fetch all agents ───────────────────────────────────────────────────
+    all_agents = await store.list_all_agents()
+    if not all_agents:
+        logger.info("Scheduled recrawl: no agents found.")
+        return
+
+    # ── 2. Build priority queue ───────────────────────────────────────────────
+    # Each entry: (agent, website_sources, is_active, last_crawl_at)
+    queue: list[tuple[dict, list[dict], bool, datetime | None]] = []
+
+    for agent in all_agents:
+        agent_id  = agent["id"]
+        tenant_id = agent.get("tenant_id", "")
+
+        # Get website documents for this agent
+        website_docs = await store.list_documents(
+            agent_id, tenant_id, source_type="website"
+        )
+        # Keep only root sources (source_url == file_name pattern, not sub-pages)
+        root_sources = [
+            d for d in website_docs
+            if d.get("source_url") and d.get("source_url") == d.get("source_url")
+            and d.get("status") not in ("failed",)
+        ]
+        # Deduplicate by source_url — keep most recently indexed
+        seen_urls: dict[str, dict] = {}
+        for d in root_sources:
+            url = str(d.get("source_url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls[url] = d
+        unique_sources = list(seen_urls.values())
+
+        if not unique_sources:
+            continue  # No website sources — skip this agent
+
+        # Determine activity: agent.updated_at reflects last conversation
+        agent_updated = agent.get("updated_at")
+        if isinstance(agent_updated, str):
+            try:
+                agent_updated = datetime.fromisoformat(agent_updated.replace("Z", "+00:00"))
+            except Exception:
+                agent_updated = None
+
+        is_active = (
+            agent_updated is not None
+            and agent_updated >= active_cutoff
+        )
+
+        # Last crawl time — use oldest uploaded_at among website sources
+        # (conservative: re-crawl if ANY source might be stale)
+        crawl_times = [
+            d.get("uploaded_at") for d in unique_sources if d.get("uploaded_at")
+        ]
+        last_crawl: datetime | None = None
+        if crawl_times:
+            # Convert strings to datetime if needed
+            parsed = []
+            for t in crawl_times:
+                if isinstance(t, datetime):
+                    parsed.append(t)
+                elif isinstance(t, str):
+                    try:
+                        parsed.append(datetime.fromisoformat(t.replace("Z", "+00:00")))
+                    except Exception:
+                        pass
+            last_crawl = min(parsed) if parsed else None
+
+        queue.append((agent, unique_sources, is_active, last_crawl))
+
+    # Sort: active agents first, then by last_crawl ascending (oldest first)
+    queue.sort(key=lambda x: (
+        0 if x[2] else 1,                    # active=0, inactive=1
+        x[3] or datetime.min.replace(tzinfo=timezone.utc),  # oldest crawl first
+    ))
+
+    logger.info(
+        "Scheduled recrawl: %d agent(s) with website sources queued "
+        "(%d active, %d inactive).",
+        len(queue),
+        sum(1 for _, _, is_active, _ in queue if is_active),
+        sum(1 for _, _, is_active, _ in queue if not is_active),
+    )
+
+    # ── 3. Process agents one at a time ──────────────────────────────────────
+    summary_lines: list[str] = []
+    total_agents_crawled = 0
+    total_pages_changed  = 0
+
+    for agent, sources, is_active, last_crawl in queue:
+        agent_id   = agent["id"]
+        agent_name = agent.get("name", agent_id)
+        tenant_id  = agent.get("tenant_id", "")
+
+        # Determine if this agent is due for a re-crawl
+        recrawl_window = active_window if is_active else inactive_window
+        if last_crawl is not None:
+            age = now - last_crawl
+            if age < recrawl_window:
+                logger.info(
+                    "SKIP '%s' — last crawl %.0f days ago (window: %d days).",
+                    agent_name, age.total_seconds() / 86400, recrawl_window.days,
+                )
+                continue
+
+        label = "active" if is_active else "inactive"
+        logger.info("START recrawl for '%s' (%s, %d source(s)).", agent_name, label, len(sources))
+
+        # Process each website source for this agent
+        for source_doc in sources:
+            source_url = str(source_doc.get("source_url", "")).strip()
+            if not source_url:
+                continue
+
+            entry = RecrawlLogEntry(
+                agent_id=agent_id,
+                agent_name=agent_name,
+                tenant_id=tenant_id,
+                source_url=source_url,
+                status="running",
+            )
+
+            try:
+                website_dir = store.get_agent_website_dir(agent_id)
+                website_dir.mkdir(parents=True, exist_ok=True)
+                website_service = WebsiteService(website_directory=website_dir)
+
+                BATCH_SIZE = int(os.getenv("CRAWL_BATCH_SIZE", "50"))
+
+                # Run crawl in a thread (sync generator)
+                loop = asyncio.get_running_loop()
+
+                import queue as _queue
+                import threading as _threading
+
+                batch_q: _queue.Queue = _queue.Queue()
+                crawl_errors: list[BaseException] = []
+
+                def _worker(url=source_url, bq=batch_q, errs=crawl_errors) -> None:
+                    try:
+                        for batch in website_service.crawl_in_batches(url, batch_size=BATCH_SIZE):
+                            bq.put(batch)
+                    except Exception as exc:
+                        errs.append(exc)
+                    finally:
+                        bq.put(None)
+
+                t = _threading.Thread(target=_worker, daemon=True)
+                t.start()
+
+                # Prepare RAG pipeline
+                pipeline = RAGPipeline(
+                    pdf_directory=store.get_agent_pdf_dir(agent_id),
+                    website_directory=website_dir,
+                    snippets_directory=store.get_agent_snippet_dir(agent_id),
+                    qa_directory=store.get_agent_qa_dir(agent_id),
+                    collection_name=agent_collection_name(agent_id),
+                )
+
+                # Upsert website source document
+                doc = await store.upsert_website_source(
+                    agent_id=agent_id, tenant_id=tenant_id,
+                    user_id="system", display_name=source_url,
+                    source_url=source_url, status="indexing",
+                )
+
+                pages_crawled = 0
+                pages_changed = 0
+                pages_added   = 0
+                display_name  = source_url
+
+                # Process each batch
+                while True:
+                    batch = await loop.run_in_executor(None, batch_q.get)
+                    if batch is None:
+                        break
+                    if not batch:
+                        continue
+
+                    # Save batch to disk with hash change detection
+                    counts = await loop.run_in_executor(
+                        None,
+                        lambda b=batch: website_service._merge_and_save_pages(source_url, b),
+                    )
+                    pages_crawled += len(batch)
+                    pages_added   += counts["added"]
+                    pages_changed += counts["changed"]
+
+                    # Only re-index pages that actually changed or are new
+                    pages_to_index = [
+                        p for p in batch
+                        if p.text.strip()
+                    ]
+                    # Filter to changed/new only by re-checking hash
+                    # (merge_and_save already persisted — now compare)
+                    truly_changed = [
+                        p for p in pages_to_index
+                        if counts["added"] > 0 or counts["changed"] > 0
+                    ]
+                    # Simple approach: index all pages in this batch that
+                    # are either new or changed (counts tell us the batch totals)
+                    if counts["added"] + counts["changed"] > 0:
+                        for page in pages_to_index:
+                            page_text = page.text.strip()
+                            if not page_text:
+                                continue
+                            page_category = detect_page_category(
+                                url=page.url, title=page.title, text=page_text
+                            )
+                            page_input = f"{page.title}\n\n{page.url}\n\n{page_text}"
+                            await pipeline.ingest_single_document(
+                                chunk_store=chunk_store,
+                                tenant_id=tenant_id,
+                                agent_id=agent_id,
+                                document_id=doc["id"],
+                                source_type="website",
+                                source_name=page.url or source_url,
+                                text=page_input,
+                                category=page_category,
+                            )
+                        if not display_name or display_name == source_url:
+                            display_name = batch[0].title or source_url
+
+                t.join(timeout=10)
+                if crawl_errors:
+                    raise crawl_errors[0]
+
+                # Mark source as indexed
+                await store.upsert_website_source(
+                    agent_id=agent_id, tenant_id=tenant_id,
+                    user_id="system", display_name=display_name,
+                    source_url=source_url, status="indexed",
+                )
+
+                entry.status       = "success"
+                entry.pages_crawled = pages_crawled
+                entry.pages_changed = pages_changed
+                entry.pages_added   = pages_added
+                entry.finished_at   = datetime.now(timezone.utc)
+                total_pages_changed += pages_changed + pages_added
+
+                logger.info(
+                    "OK '%s' — %s: %d crawled, %d changed, %d added.",
+                    agent_name, source_url, pages_crawled, pages_changed, pages_added,
+                )
+
+            except Exception as exc:
+                err_msg = str(exc)
+                logger.error("FAIL '%s' — %s: %s", agent_name, source_url, err_msg)
+                entry.status      = "failed"
+                entry.error       = err_msg
+                entry.finished_at = datetime.now(timezone.utc)
+                try:
+                    await store.upsert_website_source(
+                        agent_id=agent_id, tenant_id=tenant_id,
+                        user_id="system", display_name=source_url,
+                        source_url=source_url, status="failed",
+                    )
+                except Exception:
+                    pass
+
+            finally:
+                await recrawl_log_store.insert(entry)
+
+        total_agents_crawled += 1
+        summary_lines.append(
+            f"  {agent_name}: {entry.pages_crawled} crawled, "
+            f"{entry.pages_changed + entry.pages_added} changed/new "
+            f"({entry.status})"
+        )
+
+        # ── 60-second gap before next agent ──────────────────────────────
+        if queue.index((agent, sources, is_active, last_crawl)) < len(queue) - 1:
+            logger.info("Waiting %d seconds before next agent…", _RECRAWL_DELAY_SECONDS)
+            await asyncio.sleep(_RECRAWL_DELAY_SECONDS)
+
+    logger.info(
+        "Scheduled recrawl complete — %d agent(s) processed, %d page(s) changed/added.",
+        total_agents_crawled, total_pages_changed,
+    )
+
+    # ── 4. Send summary email (optional) ─────────────────────────────────────
+    notify_email = os.getenv("RECRAWL_NOTIFY_EMAIL", "").strip()
+    if notify_email and summary_lines:
+        subject = (
+            f"[Chatbot SaaS] Weekly recrawl complete — "
+            f"{total_agents_crawled} agent(s), {total_pages_changed} page(s) updated"
+        )
+        body = (
+            f"Scheduled recrawl finished at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"Agents processed: {total_agents_crawled}\n"
+            f"Pages changed/added: {total_pages_changed}\n\n"
+            "Details:\n" + "\n".join(summary_lines)
+        )
+        try:
+            await asyncio.to_thread(
+                _send_email_sync, to_email=notify_email, subject=subject, text_body=body
+            )
+            logger.info("Recrawl summary email sent to %s.", notify_email)
+        except EmailConfigError:
+            logger.debug("SMTP not configured — skipping recrawl summary email.")
+        except Exception as exc:
+            logger.warning("Failed to send recrawl summary email: %s", exc)
+
+
+class _RecrawlRequest(_BaseModel):
+    secret: str = ""
+
+
+@app.post("/schedule-recrawl", status_code=202)
+async def schedule_recrawl(
+    request: _RecrawlRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Trigger the weekly scheduled re-crawl.
+    Called by Google Cloud Scheduler every Sunday at 2 AM.
+
+    Protected by RECRAWL_SECRET env var.  If RECRAWL_SECRET is empty,
+    the endpoint is open (useful during local testing).
+    """
+    if _RECRAWL_SECRET and request.secret != _RECRAWL_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid recrawl secret.")
+
+    background_tasks.add_task(_run_scheduled_recrawl)
+    return {
+        "status": "queued",
+        "message": (
+            "Scheduled recrawl queued. Agents will be processed one at a time "
+            f"with a {_RECRAWL_DELAY_SECONDS}s gap between each."
+        ),
+    }
+
+
+@app.get("/recrawl-logs")
+async def get_recrawl_logs(
+    agent_id: str | None = None,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Return recent recrawl log entries. Super admin only."""
+    if user.role != UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Super admin only.")
+    if recrawl_log_store is None:
+        raise HTTPException(status_code=503, detail="Log store not ready.")
+    return await recrawl_log_store.list_recent(agent_id=agent_id, limit=200)

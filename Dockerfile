@@ -2,13 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Build tools and minimal runtime libs needed by Python packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libffi-dev libglib2.0-0 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    # --with-deps lets Playwright install every system library Chromium needs
+    # automatically — no need to maintain a manual apt package list.
+    && playwright install --with-deps chromium
 
 COPY app/ ./app/
 COPY public/ ./public/
