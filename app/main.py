@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -568,6 +571,175 @@ async def crawl_website(
     background_tasks.add_task(_run_crawl, job.id, request.agent_id, tenant_id, user.id, url)
     refreshed = await crawl_job_store.get(job.id)
     return _CrawlJobResponse(**refreshed.to_dict())
+
+
+@app.post("/crawl-single-url", response_model=_CrawlJobResponse, status_code=202)
+async def crawl_single_url(
+    request: _CrawlRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Crawl exactly ONE URL and index it as a standalone website source.
+    Uses Playwright for JS-heavy pages.
+    Does NOT follow links — strictly one page only.
+    """
+    await user.require_permission("knowledge", "write")
+
+    url = _normalize_url(request.url)
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required.")
+
+    if store is None:
+        raise HTTPException(status_code=503, detail="Store is not ready.")
+
+    try:
+        if user.role == UserRole.SUPER_ADMIN:
+            agent = await store.require_agent_any_tenant(request.agent_id)
+            tenant_id = agent["tenant_id"]
+        else:
+            await store.require_agent(request.agent_id, user.tenant_id)
+            tenant_id = user.tenant_id
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    document = await store.upsert_website_source(
+        agent_id=request.agent_id,
+        tenant_id=tenant_id,
+        user_id=user.id,
+        display_name=url,
+        source_url=url,
+        status="indexing",
+    )
+
+    job = await crawl_job_store.create(agent_id=request.agent_id, source_url=url)
+    await crawl_job_store.update(
+        job.id,
+        message="Queued for single-page crawl.",
+        current_url=url,
+        discovered_pages=1,
+        indexed_pages=0,
+        document_id=document["id"],
+        document_name=document["file_name"],
+    )
+    background_tasks.add_task(
+        _run_single_url_crawl, job.id, request.agent_id, tenant_id, user.id, url
+    )
+    refreshed = await crawl_job_store.get(job.id)
+    return _CrawlJobResponse(**refreshed.to_dict())
+
+
+async def _run_single_url_crawl(
+    job_id: str, agent_id: str, tenant_id: str, user_id: str, url: str
+) -> None:
+    """
+    Crawl exactly one URL — no link discovery, no BFS.
+    Uses crawl_single_page() which tries urllib first then Playwright.
+    """
+    global store, chunk_store, crawl_job_store
+    from app.category_detector import detect_page_category
+    from app.rag_pipeline import RAGPipeline
+    from app.website_service import WebsiteService
+
+    if store is None or chunk_store is None or crawl_job_store is None:
+        await crawl_job_store.update(
+            job_id, status="failed", stage="failed",
+            error="Crawl services are not ready.",
+            message="Crawl services are not ready.",
+        )
+        return
+
+    await crawl_job_store.update(
+        job_id, status="running", stage="crawling",
+        discovered_pages=1, indexed_pages=0,
+        current_url=url, message="Fetching page content…", error=None,
+    )
+
+    try:
+        loop = asyncio.get_running_loop()
+        website_dir = store.get_agent_website_dir(agent_id)
+        website_dir.mkdir(parents=True, exist_ok=True)
+        website_service = WebsiteService(website_directory=website_dir)
+
+        # Crawl exactly one page (Playwright fallback built-in)
+        page = await loop.run_in_executor(
+            None, lambda: website_service.crawl_single_page(url)
+        )
+
+        # Save to disk
+        await loop.run_in_executor(
+            None, lambda: website_service._merge_and_save_pages(url, [page])
+        )
+
+        # Upsert document with real title
+        doc = await store.upsert_website_source(
+            agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
+            display_name=page.title or url,
+            source_url=url, status="indexing",
+        )
+        await crawl_job_store.update(
+            job_id, stage="indexing",
+            message="Indexing page…",
+            discovered_pages=1, indexed_pages=0,
+            current_url=url,
+            document_id=doc["id"],
+            document_name=doc["file_name"],
+        )
+
+        # Index into Qdrant
+        pipeline = RAGPipeline(
+            pdf_directory=store.get_agent_pdf_dir(agent_id),
+            website_directory=website_dir,
+            snippets_directory=store.get_agent_snippet_dir(agent_id),
+            qa_directory=store.get_agent_qa_dir(agent_id),
+            collection_name=agent_collection_name(agent_id),
+        )
+        chunk_ids = await chunk_store.get_chunk_ids_by_document(doc["id"])
+        if chunk_ids:
+            pipeline.remove_document(doc["id"], chunk_ids=chunk_ids)
+            await chunk_store.delete_chunks_by_document(doc["id"])
+
+        page_text = page.text.strip()
+        page_category = detect_page_category(url=page.url, title=page.title, text=page_text)
+        page_input = f"{page.title}\n\n{page.url}\n\n{page_text}"
+        await pipeline.ingest_single_document(
+            chunk_store=chunk_store,
+            tenant_id=tenant_id, agent_id=agent_id,
+            document_id=doc["id"],
+            source_type="website",
+            source_name=page.url,
+            text=page_input,
+            category=page_category,
+        )
+
+        doc = await store.upsert_website_source(
+            agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
+            display_name=page.title or url,
+            source_url=url, status="indexed",
+        )
+        await crawl_job_store.update(
+            job_id, status="completed", stage="completed",
+            message="Page crawled and indexed.",
+            discovered_pages=1, indexed_pages=1,
+            current_url=None,
+            document_id=doc["id"],
+            document_name=doc["file_name"],
+        )
+
+    except Exception as exc:
+        if store is not None:
+            await store.upsert_website_source(
+                agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
+                display_name=url, source_url=url, status="failed",
+            )
+        err = str(exc)
+        if "401" in err or "invalid_api_key" in err.lower():
+            err = "Indexing failed: invalid or missing OpenAI API key."
+        elif "429" in err or "rate_limit" in err.lower():
+            err = "Indexing failed: OpenAI rate limit exceeded."
+        await crawl_job_store.update(
+            job_id, status="failed", stage="failed", error=err, message=err
+        )
 
 
 @app.post("/crawl-website-page", response_model=_CrawlJobResponse, status_code=202)
