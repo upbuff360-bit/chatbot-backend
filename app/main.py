@@ -870,8 +870,16 @@ async def _run_scheduled_recrawl() -> None:
     from app.services.email_service import EmailConfigError, _send_email_sync
     from app.website_service import WebsiteService
 
-    if store is None or chunk_store is None or recrawl_log_store is None:
-        logger.error("Scheduled recrawl: services not ready.")
+    # Wait up to 60 seconds for services to finish initialising.
+    # Cloud Run may trigger the scheduler at the exact moment the instance
+    # is still running its lifespan startup (DB connect, index rebuild etc.)
+    for _attempt in range(60):
+        if store is not None and chunk_store is not None and recrawl_log_store is not None:
+            break
+        logger.info("Scheduled recrawl: waiting for services to be ready (%d/60)…", _attempt + 1)
+        await asyncio.sleep(1)
+    else:
+        logger.error("Scheduled recrawl: services not ready after 60s — aborting.")
         return
 
     now = datetime.now(timezone.utc)
