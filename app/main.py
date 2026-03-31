@@ -1214,7 +1214,6 @@ class _RecrawlRequest(_BaseModel):
 @app.post("/schedule-recrawl", status_code=202)
 async def schedule_recrawl(
     request: _RecrawlRequest,
-    background_tasks: BackgroundTasks,
 ):
     """
     Trigger the weekly scheduled re-crawl.
@@ -1222,11 +1221,16 @@ async def schedule_recrawl(
 
     Protected by RECRAWL_SECRET env var.  If RECRAWL_SECRET is empty,
     the endpoint is open (useful during local testing).
+
+    Uses asyncio.create_task() instead of BackgroundTasks so the recrawl
+    keeps running even after the HTTP response is sent. BackgroundTasks
+    are tied to the request lifecycle and can be killed by Cloud Run
+    when it terminates the instance after the response completes.
     """
     if _RECRAWL_SECRET and request.secret != _RECRAWL_SECRET:
         raise HTTPException(status_code=403, detail="Invalid recrawl secret.")
 
-    background_tasks.add_task(_run_scheduled_recrawl)
+    asyncio.create_task(_run_scheduled_recrawl())
     return {
         "status": "queued",
         "message": (
