@@ -1540,6 +1540,16 @@ class _HTMLContentParser(HTMLParser):
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
+        # Fix 5: Collect <a href> links BEFORE the skip-depth check.
+        # Previously, links inside <nav>, <header>, <footer> were silently
+        # dropped because the skip-depth gate returned early before reaching
+        # the anchor-extraction code.  On most websites, nav links are the
+        # only way to discover product/service pages during urllib BFS crawl.
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.links.append(href)
+
         if tag in self._SKIP_TAGS:
             self._skip_depth += 1
             return
@@ -1547,10 +1557,6 @@ class _HTMLContentParser(HTMLParser):
             self._in_title = True
         if tag in self._BLOCK_TAGS:
             self._text_parts.append("\n")
-        if tag == "a":
-            href = dict(attrs).get("href")
-            if href:
-                self.links.append(href)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP_TAGS and self._skip_depth:

@@ -92,6 +92,70 @@ def _heuristic_sentences(text: str) -> list[str]:
     return [s.strip() for s in parts if s.strip()] or [text.strip()]
 
 
+def generate_summary_chunk(title: str, url: str, text: str) -> str:
+    """
+    Build a compact summary chunk for a single product or service page.
+
+    Structure:
+        Product: <title>
+        URL: <url>
+        <first meaningful body lines, capped at 250 chars>
+
+    Why line-based extraction instead of sentence splitting:
+      Product page titles contain no sentence terminators (.!?) so NLTK and
+      heuristic splitters merge the title + URL + first paragraph into one
+      giant "sentence" (often 300+ chars).  The old 300-char guard then broke
+      immediately on the very first token, leaving summary_body empty for most
+      product pages.
+
+      Splitting by lines is more reliable for crawled HTML text: each logical
+      block (heading, tagline, feature list) is already on its own line after
+      the HTML-to-text extraction step.  We skip lines that duplicate the
+      title or look like navigation noise, then stitch the first meaningful
+      lines into a compact body.
+
+    No LLM call — purely heuristic, zero extra API cost.
+    """
+    title_clean = title.strip()
+    url_clean   = url.strip()
+
+    # Split the full page text into non-empty lines
+    all_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    body_lines: list[str] = []
+    total_len  = 0
+    skip_set   = {title_clean, url_clean}
+
+    for line in all_lines:
+        # Skip lines that duplicate the title or URL (already in parts below)
+        if line in skip_set:
+            continue
+        # Skip very short lines (single words, phone numbers, nav items)
+        if len(line) < 20:
+            continue
+        # Skip lines that look like standalone URLs
+        if line.startswith("http://") or line.startswith("https://"):
+            continue
+        if total_len + len(line) > 250:
+            break
+        body_lines.append(line)
+        total_len += len(line) + 1
+        if len(body_lines) >= 3:
+            break
+
+    summary_body = " ".join(body_lines).strip()
+
+    parts: list[str] = []
+    if title_clean:
+        parts.append(f"Product: {title_clean}")
+    if url_clean:
+        parts.append(f"URL: {url_clean}")
+    if summary_body:
+        parts.append(summary_body)
+
+    return "\n".join(parts)
+
+
 def _char_chunks(text: str, chunk_size: int, overlap: int) -> list[str]:
     chunks: list[str] = []
     start = 0

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from app.core.dependencies import CurrentUser, get_current_user
 from app.models.user import UserRole
 from app.rag_pipeline import RAGPipeline, is_fallback_response
+from app.prompt_builder import is_list_question
 from app.services.admin_store_mongo import AdminStoreMongo
 from app.services.chunk_store import ChunkStore
 
@@ -338,19 +339,59 @@ async def _build_context(
     question: str,
     cs: ChunkStore,
     loop: asyncio.AbstractEventLoop,
+    agent_id: str = "",
 ) -> list[dict]:
+    """
+    Build context chunks for the LLM.
+
+    Summary-chunk strategy (MongoDB path)
+    ──────────────────────────────────────
+    For list questions ("what products do you offer?", "show me all solutions")
+    we fetch every summary chunk for this agent DIRECTLY from MongoDB using a
+    simple field filter (chunk_type="summary", agent_id=agent_id).
+
+    This is more reliable than the Qdrant-scroll approach because:
+    - MongoDB is the single source of truth for chunk content
+    - No dependency on Qdrant payload filters being in sync
+    - Guaranteed to return ALL products regardless of vector scores
+
+    Summary chunks are prepended so they always appear first in the context
+    window, giving the LLM a complete product list to work from.
+    Detail chunks from vector search fill the remaining slots with richer info.
+    """
+    # ── Step 1: fetch summary chunks from MongoDB for list questions ──────────
+    summary_context: list[dict] = []
+    if agent_id and is_list_question(question):
+        summary_ids = await cs.get_summary_chunk_ids_by_agent(agent_id)
+        if summary_ids:
+            summary_chunks = await cs.get_chunks_by_ids(summary_ids)
+            for c in summary_chunks:
+                content = c.get("content", "").strip()
+                if content:
+                    summary_context.append({
+                        "content": content,
+                        "source_name": c.get("source_name", "unknown"),
+                    })
+
+    # ── Step 2: normal vector search for detail chunks ────────────────────────
     new_style_ids, legacy_chunks = await loop.run_in_executor(
         None, lambda: pipeline.search_chunks(question)
     )
-    context: list[dict] = list(legacy_chunks)
+    detail_context: list[dict] = list(legacy_chunks)
+    seen_content: set[str] = {c["content"] for c in summary_context}
     if new_style_ids:
         mongo_chunks = await cs.get_chunks_by_ids(new_style_ids)
         for c in mongo_chunks:
-            context.append({
-                "content": c.get("content", ""),
-                "source_name": c.get("source_name", "unknown"),
-            })
-    return context
+            content = c.get("content", "").strip()
+            # Skip detail chunks that duplicate a summary chunk already added
+            if content and content not in seen_content:
+                detail_context.append({
+                    "content": content,
+                    "source_name": c.get("source_name", "unknown"),
+                })
+
+    # Summary chunks first, then detail chunks
+    return summary_context + detail_context
 
 
 async def route_to_llm(
@@ -360,9 +401,10 @@ async def route_to_llm(
     loop: asyncio.AbstractEventLoop,
     conversation_history: list[dict] | None = None,
     chunk_store: ChunkStore | None = None,
+    agent_id: str = "",
 ) -> str:
     if chunk_store is not None:
-        context = await _build_context(pipeline, question, chunk_store, loop)
+        context = await _build_context(pipeline, question, chunk_store, loop, agent_id=agent_id)
     else:
         context = []
     _ctx = context
@@ -496,6 +538,7 @@ async def chat(
                 question, pipeline, settings, loop,
                 conversation_history=conversation_history,
                 chunk_store=cs,
+                agent_id=request.agent_id,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -607,7 +650,7 @@ async def chat_stream(
         return StreamingResponse(intent_stream(), media_type="text/event-stream")
 
     # Build context in async land before entering the sync generator
-    context = await _build_context(pipeline, question, cs, loop)
+    context = await _build_context(pipeline, question, cs, loop, agent_id=request.agent_id)
     full_answer_parts: list[str] = []
 
     async def token_stream():
@@ -740,6 +783,7 @@ async def widget_chat(
                 question, pipeline, settings, loop,
                 conversation_history=conversation_history,
                 chunk_store=cs,
+                agent_id=request.agent_id,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc

@@ -34,8 +34,16 @@ class ChunkStore:
         source_name: str,
         chunks: list[str],
         category: str | None = None,
+        chunk_type: str = "detail",
     ) -> list[str]:
-        """Save chunks to MongoDB. Returns list of chunk IDs in same order."""
+        """
+        Save chunks to MongoDB. Returns list of chunk IDs in same order.
+
+        chunk_type — "summary" for the compact per-product summary chunk,
+                     "detail"  for normal sentence-boundary content chunks.
+        Summary chunks are fetched first for list queries; detail chunks are
+        used for specific single-product follow-up questions.
+        """
         if not chunks:
             return []
 
@@ -55,6 +63,7 @@ class ChunkStore:
                 "source_name": source_name,
                 "chunk_index": i,
                 "content": content,
+                "chunk_type": chunk_type,
                 "created_at": now,
             }
             if category:
@@ -63,6 +72,38 @@ class ChunkStore:
 
         await self._chunks.insert_many(docs)
         return ids
+
+    async def get_summary_chunk_ids_by_agent(self, agent_id: str) -> list[str]:
+        """
+        Return IDs of product-page summary chunks for this agent.
+
+        Why URL-pattern filtering instead of category field:
+          The category_detector assigns categories based on keyword scoring.
+          Product pages with strong service-related vocabulary (e.g. ATS page
+          has "maintenance", "service", "integration") score higher on
+          "service" than "product" — even though their URL is /products/*.
+          ATS and FSM were stored as category="service" because of this.
+
+          Filtering by source_name URL pattern is reliable regardless of
+          how the category_detector scored a page.  Any page whose URL
+          contains /products/, /solutions/, /items/, /store/, etc. is
+          treated as a product page for listing purposes.
+        """
+        import re as _re
+        _PRODUCT_URL_RE = _re.compile(
+            r"/(product|products|item|items|catalog|catalogue|shop|store|solution|solutions)/",
+            _re.IGNORECASE,
+        )
+
+        cursor = self._chunks.find(
+            {"agent_id": agent_id, "chunk_type": "summary"},
+            {"_id": 1, "source_name": 1},
+        )
+        docs = await cursor.to_list(length=None)
+        return [
+            d["_id"] for d in docs
+            if _PRODUCT_URL_RE.search(d.get("source_name", ""))
+        ]
 
     async def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[dict]:
         """Fetch chunks by IDs preserving Qdrant relevance order."""

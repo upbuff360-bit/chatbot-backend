@@ -388,6 +388,8 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
                     source_name=page.url or url,
                     text=page_input,
                     category=page_category,
+                    page_title=page.title,
+                    page_url=page.url,
                 )
                 indexed += 1
                 if not display_name or display_name == url:
@@ -520,6 +522,8 @@ async def _run_single_page_crawl(
                 source_name=page.url or str(document.get("source_url") or ""),
                 text=page_input,
                 category=page_category,
+                page_title=page.title,
+                page_url=page.url,
             )
 
         updated = await store.update_document(
@@ -724,6 +728,8 @@ async def _run_single_url_crawl(
             source_name=page.url,
             text=page_input,
             category=page_category,
+            page_title=page.title,
+            page_url=page.url,
         )
 
         doc = await store.upsert_website_source(
@@ -1121,6 +1127,8 @@ async def _run_scheduled_recrawl() -> None:
                                 source_name=page.url or source_url,
                                 text=page_input,
                                 category=page_category,
+                                page_title=page.title,
+                                page_url=page.url,
                             )
                         if not display_name or display_name == source_url:
                             display_name = batch[0].title or source_url

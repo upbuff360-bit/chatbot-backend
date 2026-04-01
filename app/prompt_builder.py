@@ -16,6 +16,12 @@ SYSTEM_PROMPT = (
     "Do NOT explain what UI/UX design is unless the context explains it.\n"
     "If context has no relevant info → say you don't have details on that.\n"
     "\n"
+    "RULE 1b — NEVER OMIT ITEMS WHEN LISTING:\n"
+    "When listing products or services from context, you MUST include EVERY item present.\n"
+    "Do NOT skip, merge, or omit any item — even if it looks different from the others.\n"
+    "Count the items in context first, then make sure your list has the exact same count.\n"
+    "Example: if context has 8 Product: lines, your list must have exactly 8 items.\n"
+    "\n"
     "RULE 2 — NEVER ADD CONTACT SUGGESTIONS WHEN YOU HAVE AN ANSWER:\n"
     "If you answered the question: STOP after the answer.\n"
     "NEVER add phrases like:\n"
@@ -92,9 +98,22 @@ COMPARISON_TRIGGERS = [
 ]
 
 LIST_TRIGGERS = [
-    "all", "list", "every", "what do you offer", "what products",
-    "what services", "what do you have", "show me all", "full list",
+    # Explicit listing phrases
+    "all", "list", "every", "full list",
+    # Direct offer / product queries
+    "what do you offer", "what products", "what services",
+    "what do you have", "what do you provide",
+    "show me all", "show me your", "show me what",
     "how many products", "how many services",
+    # Natural conversational variants (previously missed)
+    "what can you do", "what solutions", "what options",
+    "what are your", "what are the products", "what are the services",
+    "tell me about your products", "tell me about your services",
+    "tell me what you offer", "tell me your products",
+    "do you have any products", "do you have any services",
+    "which products", "which services",
+    "give me a list", "give me all",
+    "overview of your", "summary of your",
 ]
 
 QUERY_SYNONYMS: dict[str, list[str]] = {

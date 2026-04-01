@@ -87,20 +87,74 @@ class RAGPipeline:
         source_name: str,
         text: str,
         category: str | None = None,
+        page_title: str = "",
+        page_url: str = "",
     ) -> int:
-        """Ingest one document: save chunks to MongoDB then embed into Qdrant."""
+        """
+        Ingest one document: save chunks to MongoDB then embed into Qdrant.
+
+        Two-tier chunking strategy
+        --------------------------
+        For product and service pages (category == "product" | "service"):
+
+          Tier 1 — Summary chunk (1 per page)
+            A compact ~250-char string: "Product: <title>\\nURL: <url>\\n<first sentences>"
+            Stored with chunk_type="summary" in both MongoDB and Qdrant payload.
+            Matched first for broad listing queries ("what products do you offer?")
+            so every product gets a slot regardless of top-k competition.
+
+          Tier 2 — Detail chunks (N per page, normal 800-char splits)
+            Standard sentence-boundary chunks used for specific follow-up
+            questions ("tell me more about the CRM product").
+            Stored with chunk_type="detail".
+
+        For general/pricing pages only detail chunks are created (no summary).
+        """
         if not text.strip() or not self.embedding_service.is_configured():
             return 0
 
+        total_indexed = 0
+        self.vector_store.initialize_collection(recreate=False)
+
+        # ── Tier 1: Summary chunk (product and service pages only) ────────────
+        if category in ("product", "service") and (page_title or page_url):
+            from app.chunking import generate_summary_chunk
+            summary_text = generate_summary_chunk(
+                title=page_title,
+                url=page_url,
+                text=text,
+            )
+            if summary_text.strip():
+                summary_ids = await chunk_store.save_chunks(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    document_id=document_id,
+                    source_type=source_type,
+                    source_name=source_name,
+                    chunks=[summary_text],
+                    category=category,
+                    chunk_type="summary",
+                )
+                summary_embeddings = self.embedding_service.embed_texts([summary_text])
+                self.vector_store.upsert_chunks(
+                    chunks=[summary_text],
+                    embeddings=summary_embeddings,
+                    source_files=[source_name],
+                    chunk_ids=summary_ids,
+                    chunk_types=["summary"],
+                )
+                total_indexed += 1
+
+        # ── Tier 2: Detail chunks (all pages) ─────────────────────────────────
         chunks = chunk_text(
             text,
             chunk_size=int(os.getenv("CHUNK_SIZE", "800")),
             overlap=int(os.getenv("CHUNK_OVERLAP", "150")),
         )
         if not chunks:
-            return 0
+            return total_indexed
 
-        chunk_ids = await chunk_store.save_chunks(
+        detail_ids = await chunk_store.save_chunks(
             tenant_id=tenant_id,
             agent_id=agent_id,
             document_id=document_id,
@@ -108,19 +162,20 @@ class RAGPipeline:
             source_name=source_name,
             chunks=chunks,
             category=category,
+            chunk_type="detail",
         )
 
-        embeddings = self.embedding_service.embed_texts(chunks)
-
-        self.vector_store.initialize_collection(recreate=False)
+        detail_embeddings = self.embedding_service.embed_texts(chunks)
         self.vector_store.upsert_chunks(
             chunks=chunks,
-            embeddings=embeddings,
+            embeddings=detail_embeddings,
             source_files=[source_name] * len(chunks),
-            chunk_ids=chunk_ids,
+            chunk_ids=detail_ids,
+            chunk_types=["detail"] * len(chunks),
         )
+        total_indexed += len(chunks)
 
-        return len(chunks)
+        return total_indexed
 
     async def rebuild_index_from_mongo(
         self,
@@ -137,12 +192,17 @@ class RAGPipeline:
         chunk_ids    = [c["_id"] for c in all_chunks]
         source_files = [c["source_name"] for c in all_chunks]
 
+        # Preserve chunk_type so summary chunks remain filterable after rebuild.
+        # Old chunks without chunk_type default to "detail" — safe fallback.
+        chunk_types  = [c.get("chunk_type", "detail") for c in all_chunks]
+
         embeddings = self.embedding_service.embed_texts(chunks_text)
         self.vector_store.upsert_chunks(
             chunks=chunks_text,
             embeddings=embeddings,
             source_files=source_files,
             chunk_ids=chunk_ids,
+            chunk_types=chunk_types,
         )
         return len(all_chunks)
 
@@ -181,8 +241,19 @@ class RAGPipeline:
         - new_style_ids: chunk IDs to fetch from MongoDB
         - legacy_matches: chunks with text already in Qdrant payload (old data)
 
-        Enhancement 5: passes llm_client to expand_query so LLM rewrites are
-        used when synonym expansion produces fewer than 2 variants.
+        Summary-chunk strategy (two-tier retrieval)
+        -------------------------------------------
+        For list questions ("what products do you offer?"), the pipeline first
+        fetches every summary chunk (chunk_type="summary") via a Qdrant payload
+        filter — no vector scoring needed.  These are prepended to new_style_ids
+        so the LLM always sees a complete product list regardless of top-k.
+
+        Normal vector search then fills the remaining slots with detail chunks
+        for richer context on whichever products are most query-relevant.
+
+        For non-list questions (specific product follow-ups, comparisons) the
+        summary chunks are NOT prepended — only the standard vector search runs,
+        so the answer stays focused on the asked product.
         """
         if not self.vector_store.collection_exists():
             return [], []
@@ -196,8 +267,10 @@ class RAGPipeline:
             retrieval_limit = self.retrieval_limit * 2
             threshold = max(self.similarity_threshold - 0.05, 0.08)
         elif is_list_question(question):
+            # Lower threshold so niche-term products (SAP, FSM, ERP) are not
+            # silently dropped from listing results due to domain specificity.
             retrieval_limit = self.retrieval_limit * 3
-            threshold = max(self.similarity_threshold - 0.07, 0.06)
+            threshold = max(self.similarity_threshold - 0.10, 0.04)
         else:
             retrieval_limit = self.retrieval_limit
             threshold = self.similarity_threshold

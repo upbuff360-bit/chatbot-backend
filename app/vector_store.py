@@ -49,11 +49,16 @@ class VectorStore:
         embeddings: list[list[float]],
         source_files: list[str],
         chunk_ids: list[str] | None = None,
+        chunk_types: list[str] | None = None,
     ) -> None:
         """
         Upsert chunks into Qdrant.
-        If chunk_ids provided (MongoDB IDs), store them in payload instead of full text.
-        This makes Qdrant a pure search index — text lives in MongoDB.
+
+        chunk_ids   — if provided, Qdrant stores only the ID; full text lives
+                      in MongoDB (preferred mode).
+        chunk_types — parallel list of "summary" | "detail" per chunk.
+                      Stored in the Qdrant payload so get_summary_chunk_ids()
+                      can filter without touching MongoDB.
         """
         if not chunks:
             return
@@ -64,8 +69,6 @@ class VectorStore:
         ):
             point_id = chunk_ids[i] if chunk_ids else str(uuid4())
 
-            # If chunk_ids provided → Qdrant is ID-only index (text in MongoDB)
-            # If no chunk_ids → legacy mode, store chunk text in payload
             payload = {
                 "source_file": source_file,
                 "source_url": source_file if source_file.startswith("http") else "",
@@ -74,6 +77,13 @@ class VectorStore:
                 payload["chunk_id"] = chunk_ids[i]
             else:
                 payload["chunk"] = chunk  # legacy fallback
+
+            # Store chunk_type so summary chunks can be filtered via Qdrant
+            # scroll without a MongoDB round-trip.
+            if chunk_types:
+                payload["chunk_type"] = chunk_types[i]
+            else:
+                payload["chunk_type"] = "detail"  # safe default for old data
 
             points.append(
                 models.PointStruct(
@@ -84,6 +94,45 @@ class VectorStore:
             )
 
         self.client.upsert(collection_name=self.collection_name, points=points)
+
+    def get_summary_chunk_ids(self) -> list[str]:
+        """
+        Scroll the Qdrant collection and return chunk_ids for every point
+        whose payload has chunk_type == "summary".
+
+        Called synchronously from search_chunks() for list questions — no
+        MongoDB round-trip required because the chunk_type is stored in the
+        Qdrant payload at ingestion time.
+        """
+        result_ids: list[str] = []
+        offset = None
+
+        while True:
+            response = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="chunk_type",
+                            match=models.MatchValue(value="summary"),
+                        )
+                    ]
+                ),
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+            points, next_offset = response
+            for p in points:
+                cid = (p.payload or {}).get("chunk_id")
+                if cid:
+                    result_ids.append(cid)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return result_ids
 
     def delete_chunks_by_ids(self, chunk_ids: list[str]) -> None:
         """Delete specific points from Qdrant by their IDs."""
