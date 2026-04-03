@@ -27,7 +27,7 @@ from app.recrawl_log_store import RecrawlLogEntry, RecrawlLogStore
 from app.models.user import UserRole
 from app.services.admin_store_mongo import AdminStoreMongo
 from app.services.chunk_store import ChunkStore
-from app.routes import auth, agents, documents, chat, dashboard, roles, users, plans, billing, contact
+from app.routes import auth, agents, documents, chat, dashboard, roles, users, plans, billing
 
 # Global instances — injected into routes via dependency functions
 store: AdminStoreMongo | None = None
@@ -173,7 +173,6 @@ app.include_router(roles.router)
 app.include_router(users.router)
 app.include_router(plans.router)
 app.include_router(billing.router)
-app.include_router(contact.router)
 
 
 @app.get("/health")
