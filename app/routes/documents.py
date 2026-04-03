@@ -204,6 +204,16 @@ async def list_documents(
     response.headers["Cache-Control"] = "private, max-age=30, stale-while-revalidate=60"
     docs = await store.list_documents(agent_id, tenant_id)
     website_sources = WebsiteService(store.get_agent_website_dir(agent_id)).list_sources()
+
+    # Load manual knowledge records from disk so we can enrich text_snippet /
+    # qa documents whose content is NOT stored in MongoDB.
+    _manual_service = ManualKnowledgeService(
+        snippets_directory=store.get_agent_snippet_dir(agent_id),
+        qa_directory=store.get_agent_qa_dir(agent_id),
+    )
+    snippets_on_disk = _manual_service.list_text_snippets()
+    qa_on_disk = _manual_service.list_qa()
+
     enriched_docs: list[DocumentResponse] = []
     for doc in docs:
         payload = {**doc, "uploaded_at": doc.get("uploaded_at")}
@@ -219,6 +229,19 @@ async def list_documents(
                 if mongo_urls:
                     payload["page_count"] = len(mongo_urls)
                     payload["page_urls"] = mongo_urls
+        elif doc.get("source_type") == "text_snippet":
+            # content is stored on disk; fall back to MongoDB if already
+            # persisted there (post-fix documents will have it in Mongo too).
+            if not payload.get("content"):
+                record = snippets_on_disk.get(str(doc.get("id", "")))
+                if record:
+                    payload["content"] = record.content
+        elif doc.get("source_type") == "qa":
+            # answer is stored on disk; same fallback strategy as above.
+            if not payload.get("answer"):
+                record = qa_on_disk.get(str(doc.get("id", "")))
+                if record:
+                    payload["answer"] = record.answer
         enriched_docs.append(DocumentResponse(**payload))
     return enriched_docs
 
@@ -414,11 +437,15 @@ async def add_text_snippet(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}") from exc
 
-    doc["status"] = "indexed"
-    await store.mark_document_uploaded(
-        agent_id, tenant_id, user.id, title, "text_snippet", status="indexed"
+    # Persist content to MongoDB so it survives Cloud Run restarts and is
+    # returned directly by list_documents without needing disk enrichment.
+    updated = await store.update_document(
+        doc["id"], agent_id, tenant_id,
+        file_name=title,
+        content=content.strip(),
     )
-    return DocumentResponse(**doc)
+    updated["status"] = "indexed"
+    return DocumentResponse(**updated)
 
 
 # ── Add Q&A ───────────────────────────────────────────────────────────────────
@@ -471,11 +498,14 @@ async def add_qa(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}") from exc
 
-    doc["status"] = "indexed"
-    await store.mark_document_uploaded(
-        agent_id, tenant_id, user.id, question[:80], "qa", status="indexed"
+    # Persist answer to MongoDB so it survives Cloud Run restarts.
+    updated = await store.update_document(
+        doc["id"], agent_id, tenant_id,
+        file_name=question[:80],
+        answer=answer.strip(),
     )
-    return DocumentResponse(**doc)
+    updated["status"] = "indexed"
+    return DocumentResponse(**updated)
 
 
 @router.put("/documents/{document_id}", response_model=DocumentResponse)
@@ -523,8 +553,11 @@ async def update_document(
                 source_name=next_name,
                 text=f"{next_name}\n\n{next_content}",
             )
-            updated = await store.update_document(document_id, agent_id, tenant_id, file_name=next_name)
-            updated["content"] = next_content
+            updated = await store.update_document(
+                document_id, agent_id, tenant_id,
+                file_name=next_name,
+                content=next_content,
+            )
             return DocumentResponse(**updated)
 
         if source_type == "qa":
@@ -550,8 +583,11 @@ async def update_document(
                 source_name=next_name,
                 text=f"Q: {next_name}\nA: {next_answer}",
             )
-            updated = await store.update_document(document_id, agent_id, tenant_id, file_name=next_name)
-            updated["answer"] = next_answer
+            updated = await store.update_document(
+                document_id, agent_id, tenant_id,
+                file_name=next_name,
+                answer=next_answer,
+            )
             return DocumentResponse(**updated)
 
         if source_type in FILE_SOURCE_TYPES:

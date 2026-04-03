@@ -359,7 +359,7 @@ async def _build_context(
     window, giving the LLM a complete product list to work from.
     Detail chunks from vector search fill the remaining slots with richer info.
     """
-    # ── Step 1: fetch summary chunks from MongoDB for list questions ──────────
+    # ── Step 1a: fetch summary chunks from MongoDB for list questions ─────────
     summary_context: list[dict] = []
     if agent_id and is_list_question(question):
         summary_ids = await cs.get_summary_chunk_ids_by_agent(agent_id)
@@ -372,6 +372,27 @@ async def _build_context(
                         "content": content,
                         "source_name": c.get("source_name", "unknown"),
                     })
+
+    # ── Step 1b: pin text_snippet and QA chunks for list questions ───────────
+    # Manually added text snippets and Q&A entries have no summary chunk and
+    # their source_name is a plain title — not a URL — so they never appear in
+    # step 1a even with the URL filter removed.  We always pin them here so
+    # user-curated knowledge (e.g. "Asset Management System") is NEVER silently
+    # dropped from listing answers regardless of vector scores.
+    # NOTE: Files (PDFs, DOCX, etc.) and general website pages are covered by
+    # the vector search in step 2 which uses a 3× retrieval limit + lower
+    # threshold for list questions, ensuring broad knowledge base coverage.
+    if agent_id and is_list_question(question):
+        manual_chunks = await cs.get_text_snippet_and_qa_chunks_by_agent(agent_id)
+        seen_manual: set[str] = {c["content"] for c in summary_context}
+        for c in manual_chunks:
+            chunk_content = c.get("content", "").strip()
+            if chunk_content and chunk_content not in seen_manual:
+                seen_manual.add(chunk_content)
+                summary_context.append({
+                    "content": chunk_content,
+                    "source_name": c.get("source_name", "unknown"),
+                })
 
     # ── Step 2: normal vector search for detail chunks ────────────────────────
     new_style_ids, legacy_chunks = await loop.run_in_executor(
@@ -390,7 +411,7 @@ async def _build_context(
                     "source_name": c.get("source_name", "unknown"),
                 })
 
-    # Summary chunks first, then detail chunks
+    # Summary chunks (+ pinned manual knowledge) first, then detail chunks
     return summary_context + detail_context
 
 

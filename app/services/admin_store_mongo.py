@@ -778,10 +778,16 @@ class AdminStoreMongo:
         tenant_id: str,
         file_name: str,
         source_url: Optional[str] = None,
+        content: Optional[str] = None,
+        answer: Optional[str] = None,
     ) -> dict[str, Any]:
         updates: dict[str, Any] = {"file_name": file_name}
         if source_url is not None:
             updates["source_url"] = source_url
+        if content is not None:
+            updates["content"] = content
+        if answer is not None:
+            updates["answer"] = answer
         result = await self._documents.find_one_and_update(
             {"_id": document_id, "agent_id": agent_id, "tenant_id": tenant_id},
             {"$set": updates},

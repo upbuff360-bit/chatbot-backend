@@ -75,35 +75,40 @@ class ChunkStore:
 
     async def get_summary_chunk_ids_by_agent(self, agent_id: str) -> list[str]:
         """
-        Return IDs of product-page summary chunks for this agent.
+        Return IDs of ALL summary chunks for this agent across every source type.
 
-        Why URL-pattern filtering instead of category field:
-          The category_detector assigns categories based on keyword scoring.
-          Product pages with strong service-related vocabulary (e.g. ATS page
-          has "maintenance", "service", "integration") score higher on
-          "service" than "product" — even though their URL is /products/*.
-          ATS and FSM were stored as category="service" because of this.
+        Previously this filtered by URL pattern (/products/, /solutions/, etc.)
+        which silently excluded:
+          - Website pages whose product content lives at non-standard URLs
+          - Any summary chunk whose source_name doesn't match the hardcoded regex
 
-          Filtering by source_name URL pattern is reliable regardless of
-          how the category_detector scored a page.  Any page whose URL
-          contains /products/, /solutions/, /items/, /store/, etc. is
-          treated as a product page for listing purposes.
+        The URL filter is removed. Summary chunks are compact ~250-char
+        representations created only for product/service category pages during
+        ingestion, so every chunk with chunk_type="summary" is already a
+        meaningful product/service entry — no URL filter needed.
         """
-        import re as _re
-        _PRODUCT_URL_RE = _re.compile(
-            r"/(product|products|item|items|catalog|catalogue|shop|store|solution|solutions)/",
-            _re.IGNORECASE,
-        )
-
         cursor = self._chunks.find(
             {"agent_id": agent_id, "chunk_type": "summary"},
-            {"_id": 1, "source_name": 1},
+            {"_id": 1},
         )
         docs = await cursor.to_list(length=None)
-        return [
-            d["_id"] for d in docs
-            if _PRODUCT_URL_RE.search(d.get("source_name", ""))
-        ]
+        return [d["_id"] for d in docs]
+
+    async def get_text_snippet_and_qa_chunks_by_agent(self, agent_id: str) -> list[dict]:
+        """
+        Return ALL chunks for text_snippet and qa source types for this agent.
+
+        These are manually curated by the user so they must ALWAYS appear in
+        list-question answers, regardless of vector similarity scores or URL
+        patterns.  Unlike crawled product pages they have no summary chunk and
+        their source_name is a plain title (not a URL), so they are invisible
+        to get_summary_chunk_ids_by_agent's URL-pattern filter.
+        """
+        cursor = self._chunks.find(
+            {"agent_id": agent_id, "source_type": {"$in": ["text_snippet", "qa"]}},
+            {"_id": 1, "content": 1, "source_name": 1, "source_type": 1},
+        )
+        return await cursor.to_list(length=None)
 
     async def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[dict]:
         """Fetch chunks by IDs preserving Qdrant relevance order."""
