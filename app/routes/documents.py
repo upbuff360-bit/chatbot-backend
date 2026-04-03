@@ -210,8 +210,15 @@ async def list_documents(
         if doc.get("source_type") == "website":
             summary = website_sources.get(str(doc.get("source_url") or "").strip())
             if summary:
+                # Disk data available (local dev or fresh Cloud Run instance)
                 payload["page_count"] = summary.page_count
                 payload["page_urls"] = summary.page_urls
+            else:
+                # Disk wiped (Cloud Run restart) — use MongoDB persisted data
+                mongo_urls = doc.get("page_urls") or []
+                if mongo_urls:
+                    payload["page_count"] = len(mongo_urls)
+                    payload["page_urls"] = mongo_urls
         enriched_docs.append(DocumentResponse(**payload))
     return enriched_docs
 
@@ -599,14 +606,38 @@ async def list_website_pages(
     await user.require_permission("knowledge", "read")
     try:
         _, document = await _get_website_document(agent_id, document_id, user, store, allow_shared=True)
+        source_url = str(document.get("source_url") or "")
         website_service = WebsiteService(store.get_agent_website_dir(agent_id))
-        return [
-            WebsitePageResponse(index=page.index, url=page.url, title=page.title, text=page.text)
-            for page in website_service.list_source_pages(str(document.get("source_url") or ""))
-        ]
+
+        # Try reading from local disk first (fast path — works locally and
+        # immediately after a manual crawl on Cloud Run)
+        disk_pages = []
+        try:
+            disk_pages = website_service.list_source_pages(source_url)
+        except (FileNotFoundError, ValueError):
+            pass
+
+        if disk_pages:
+            return [
+                WebsitePageResponse(index=p.index, url=p.url, title=p.title, text=p.text)
+                for p in disk_pages
+            ]
+
+        # Fallback: read page_urls persisted in MongoDB.
+        # This is the only data that survives Cloud Run restarts / ephemeral
+        # disk resets — the scheduled recrawl saves page_urls to MongoDB
+        # after every successful crawl.
+        mongo_page_urls: list[str] = document.get("page_urls") or []
+        if mongo_page_urls:
+            return [
+                WebsitePageResponse(index=i, url=url, title=url, text="")
+                for i, url in enumerate(mongo_page_urls)
+            ]
+
+        # Nothing found anywhere
+        return []
+
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

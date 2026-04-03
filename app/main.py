@@ -27,7 +27,7 @@ from app.recrawl_log_store import RecrawlLogEntry, RecrawlLogStore
 from app.models.user import UserRole
 from app.services.admin_store_mongo import AdminStoreMongo
 from app.services.chunk_store import ChunkStore
-from app.routes import auth, agents, documents, chat, dashboard, roles, users, plans, billing
+from app.routes import auth, agents, documents, chat, dashboard, roles, users, plans, billing, contact
 
 # Global instances — injected into routes via dependency functions
 store: AdminStoreMongo | None = None
@@ -173,6 +173,7 @@ app.include_router(roles.router)
 app.include_router(users.router)
 app.include_router(plans.router)
 app.include_router(billing.router)
+app.include_router(contact.router)
 
 
 @app.get("/health")
@@ -388,8 +389,6 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
                     source_name=page.url or url,
                     text=page_input,
                     category=page_category,
-                    page_title=page.title,
-                    page_url=page.url,
                 )
                 indexed += 1
                 if not display_name or display_name == url:
@@ -522,8 +521,6 @@ async def _run_single_page_crawl(
                 source_name=page.url or str(document.get("source_url") or ""),
                 text=page_input,
                 category=page_category,
-                page_title=page.title,
-                page_url=page.url,
             )
 
         updated = await store.update_document(
@@ -728,8 +725,6 @@ async def _run_single_url_crawl(
             source_name=page.url,
             text=page_input,
             category=page_category,
-            page_title=page.title,
-            page_url=page.url,
         )
 
         doc = await store.upsert_website_source(
@@ -1127,8 +1122,6 @@ async def _run_scheduled_recrawl() -> None:
                                 source_name=page.url or source_url,
                                 text=page_input,
                                 category=page_category,
-                                page_title=page.title,
-                                page_url=page.url,
                             )
                         if not display_name or display_name == source_url:
                             display_name = batch[0].title or source_url
@@ -1137,11 +1130,15 @@ async def _run_scheduled_recrawl() -> None:
                 if crawl_errors:
                     raise crawl_errors[0]
 
-                # Mark source as indexed
+                # Mark source as indexed and persist page URLs to MongoDB
+                # so the Knowledge tab works even after Cloud Run disk resets
+                stored_pages = website_service.list_source_pages(source_url)
+                page_url_list = [p.url for p in stored_pages if p.url]
                 await store.upsert_website_source(
                     agent_id=agent_id, tenant_id=tenant_id,
                     user_id="system", display_name=display_name,
                     source_url=source_url, status="indexed",
+                    page_urls=page_url_list,
                 )
 
                 entry.status       = "success"

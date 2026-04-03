@@ -709,7 +709,14 @@ class AdminStoreMongo:
         display_name: str,
         source_url: str,
         status: str = "indexed",
+        page_urls: list[str] | None = None,
     ) -> dict[str, Any]:
+        """
+        Upsert a website source document in MongoDB.
+
+        page_urls: persisted in MongoDB so the Knowledge tab can display
+        crawled pages even after Cloud Run restarts wipe the ephemeral disk.
+        """
         now = _now()
         existing = await self._documents.find_one({
             "agent_id": agent_id,
@@ -717,13 +724,17 @@ class AdminStoreMongo:
             "source_type": "website",
             "source_url": source_url,
         })
+
+        update_fields: dict = {"file_name": display_name, "status": status}
+        if page_urls is not None:
+            update_fields["page_urls"] = page_urls
+
         if existing:
             await self._documents.update_one(
                 {"_id": existing["_id"]},
-                {"$set": {"file_name": display_name, "status": status}},
+                {"$set": update_fields},
             )
-            existing["file_name"] = display_name
-            existing["status"] = status
+            existing.update(update_fields)
             existing["id"] = existing.pop("_id")
             return existing
 
@@ -738,6 +749,8 @@ class AdminStoreMongo:
             "status": status,
             "uploaded_at": now,
         }
+        if page_urls is not None:
+            doc["page_urls"] = page_urls
         await self._documents.insert_one(doc)
         await self._agents.update_one(
             {"_id": agent_id, "tenant_id": tenant_id},
