@@ -413,11 +413,14 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
         if not all_pages:
             raise ValueError("No readable website content was found at the provided URL.")
 
-        # Mark the source as fully indexed
+        # Mark the source as fully indexed and persist page URLs to MongoDB
+        # so the Knowledge tab shows crawled pages after Cloud Run restarts.
+        page_url_list = [p.url for p in all_pages if p.url]
         doc = await store.upsert_website_source(
             agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
             display_name=display_name,
             source_url=url, status="indexed",
+            page_urls=page_url_list,
         )
         await crawl_job_store.update(
             job_id,
@@ -522,10 +525,15 @@ async def _run_single_page_crawl(
                 category=page_category,
             )
 
-        updated = await store.update_document(
-            document["id"], agent_id, tenant_id,
-            file_name=pages[0].title.strip() or str(document.get("source_url") or ""),
+        # Persist the updated page URL list to MongoDB so the Knowledge tab
+        # shows all pages (including the newly added one) after Cloud Run restarts.
+        all_page_urls = [p.url for p in pages if p.url]
+        updated = await store.upsert_website_source(
+            agent_id=agent_id, tenant_id=tenant_id, user_id=user_id,
+            display_name=pages[0].title.strip() or str(document.get("source_url") or ""),
             source_url=str(document.get("source_url") or ""),
+            status="indexed",
+            page_urls=all_page_urls,
         )
         await crawl_job_store.update(
             job_id, status="completed", stage="completed",

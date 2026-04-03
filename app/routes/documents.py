@@ -443,8 +443,8 @@ async def add_text_snippet(
         doc["id"], agent_id, tenant_id,
         file_name=title,
         content=content.strip(),
+        status="indexed",
     )
-    updated["status"] = "indexed"
     return DocumentResponse(**updated)
 
 
@@ -503,8 +503,8 @@ async def add_qa(
         doc["id"], agent_id, tenant_id,
         file_name=question[:80],
         answer=answer.strip(),
+        status="indexed",
     )
-    updated["status"] = "indexed"
     return DocumentResponse(**updated)
 
 
@@ -557,6 +557,7 @@ async def update_document(
                 document_id, agent_id, tenant_id,
                 file_name=next_name,
                 content=next_content,
+                status="indexed",
             )
             return DocumentResponse(**updated)
 
@@ -587,6 +588,7 @@ async def update_document(
                 document_id, agent_id, tenant_id,
                 file_name=next_name,
                 answer=next_answer,
+                status="indexed",
             )
             return DocumentResponse(**updated)
 
