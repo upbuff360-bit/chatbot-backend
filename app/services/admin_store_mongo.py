@@ -10,6 +10,7 @@ and writes go directly to MongoDB via the shared motor client.
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import re
 import secrets
 from typing import Any, Optional
 from uuid import uuid4
@@ -39,6 +40,10 @@ def _normalize_email(value: str) -> str:
     return value.strip().lower()
 
 
+def _normalize_phone(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
 class AdminStoreMongo:
     def __init__(self, db: AsyncIOMotorDatabase, agents_root: str | Path = "./data/agents") -> None:
         self.db = db
@@ -49,6 +54,7 @@ class AdminStoreMongo:
         self._agents = db.agents
         self._documents = db.documents
         self._conversations = db.conversations
+        self._leads = db.leads
         self._activity = db.activity
         self._fallback_logs = db.fallback_logs
         self._agent_invitations = db.agent_invitations
@@ -87,6 +93,57 @@ class AdminStoreMongo:
             "description": description,
             "timestamp": _now(),
         })
+
+    async def _find_matching_leads(
+        self,
+        *,
+        tenant_id: str,
+        agent_id: str,
+        conversation_id: str,
+        email: str | None,
+        normalized_email: str | None,
+        normalized_phone: str | None,
+    ) -> list[dict[str, Any]]:
+        base_query = {"tenant_id": tenant_id, "agent_id": agent_id}
+        matches: dict[str, dict[str, Any]] = {}
+
+        def remember(doc: dict[str, Any] | None) -> None:
+            if not doc:
+                return
+            matches[str(doc["_id"])] = doc
+
+        remember(await self._leads.find_one({**base_query, "conversation_id": conversation_id}))
+
+        if normalized_email:
+            email_value = (email or "").strip()
+            email_matches = await self._leads.find({
+                **base_query,
+                "$or": [
+                    {"email_normalized": normalized_email},
+                    {"email": {"$regex": f"^{re.escape(email_value)}$", "$options": "i"}},
+                ],
+            }).to_list(length=20)
+            for doc in email_matches:
+                remember(doc)
+
+        if normalized_phone:
+            phone_matches = await self._leads.find({
+                **base_query,
+                "phone_normalized": normalized_phone,
+            }).to_list(length=20)
+            for doc in phone_matches:
+                remember(doc)
+
+            phone_candidates = await self._leads.find(
+                {**base_query, "phone": {"$exists": True, "$ne": None}},
+                projection={"phone": 1, "created_at": 1},
+            ).to_list(length=200)
+            for candidate in phone_candidates:
+                candidate_phone = _normalize_phone(str(candidate.get("phone") or ""))
+                if candidate_phone and candidate_phone == normalized_phone:
+                    remember(await self._leads.find_one({**base_query, "_id": candidate["_id"]}))
+
+        return sorted(matches.values(), key=lambda doc: doc.get("created_at") or _now())
 
     # ── Users ─────────────────────────────────────────────────────────────────
 
@@ -860,14 +917,18 @@ class AdminStoreMongo:
         )
         if doc is None:
             raise KeyError(f"Agent '{agent_id}' not found.")
-        return doc.get("settings", AgentSettings().model_dump())
+        merged = AgentSettings().model_dump()
+        merged.update(doc.get("settings", {}))
+        return merged
 
     async def update_settings(
         self, agent_id: str, tenant_id: str, settings: dict[str, Any]
     ) -> dict[str, Any]:
+        merged = AgentSettings().model_dump()
+        merged.update(settings)
         result = await self._agents.find_one_and_update(
             {"_id": agent_id, "tenant_id": tenant_id},
-            {"$set": {"settings": settings, "updated_at": _now()}},
+            {"$set": {"settings": merged, "updated_at": _now()}},
             return_document=True,
             projection={"settings": 1},
         )
@@ -879,6 +940,95 @@ class AdminStoreMongo:
         return result["settings"]
 
     # ── Conversations ─────────────────────────────────────────────────────────
+
+    async def upsert_lead(
+        self,
+        *,
+        tenant_id: str,
+        agent_id: str,
+        conversation_id: str,
+        source: str,
+        name: str | None = None,
+        email: str | None = None,
+        phone: str | None = None,
+        company: str | None = None,
+        interest: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        normalized_email = _normalize_email(email) if email else None
+        normalized_phone = _normalize_phone(phone) if phone else None
+
+        query = {"tenant_id": tenant_id, "agent_id": agent_id, "conversation_id": conversation_id}
+        matches = await self._find_matching_leads(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            email=email,
+            normalized_email=normalized_email,
+            normalized_phone=normalized_phone,
+        )
+        existing = matches[0] if matches else None
+        merged_existing: dict[str, Any] = {}
+        for doc in matches:
+            for field in (
+                "_id",
+                "tenant_id",
+                "agent_id",
+                "conversation_id",
+                "latest_conversation_id",
+                "source",
+                "name",
+                "email",
+                "email_normalized",
+                "phone",
+                "phone_normalized",
+                "company",
+                "interest",
+                "notes",
+                "created_at",
+                "updated_at",
+            ):
+                if merged_existing.get(field) in (None, "") and doc.get(field) not in (None, ""):
+                    merged_existing[field] = doc.get(field)
+
+        payload = {
+            "_id": merged_existing.get("_id") if existing else _new_id(),
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            # Keep the original lead thread identity so later chats enrich the same lead.
+            "conversation_id": merged_existing.get("conversation_id") if existing else conversation_id,
+            "latest_conversation_id": conversation_id or (merged_existing.get("latest_conversation_id") if existing else None),
+            "source": merged_existing.get("source", source) if existing else source,
+            "name": name or (merged_existing.get("name") if existing else None),
+            "email": email or (merged_existing.get("email") if existing else None),
+            "email_normalized": normalized_email or (merged_existing.get("email_normalized") if existing else None),
+            "phone": phone or (merged_existing.get("phone") if existing else None),
+            "phone_normalized": normalized_phone or (merged_existing.get("phone_normalized") if existing else None),
+            "company": company or (merged_existing.get("company") if existing else None),
+            "interest": interest or (merged_existing.get("interest") if existing else None),
+            "notes": notes or (merged_existing.get("notes") if existing else None),
+            "created_at": merged_existing.get("created_at", now) if existing else now,
+            "updated_at": now,
+        }
+        replace_query = {"_id": payload["_id"]} if existing else query
+        await self._leads.replace_one(replace_query, payload, upsert=True)
+        duplicate_ids = [doc["_id"] for doc in matches[1:] if doc.get("_id") != payload["_id"]]
+        if duplicate_ids:
+            await self._leads.delete_many({"_id": {"$in": duplicate_ids}})
+        payload["id"] = str(payload.pop("_id"))
+        return payload
+
+    async def list_leads(self, agent_id: str, tenant_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        cursor = self._leads.find(
+            {"agent_id": agent_id, "tenant_id": tenant_id},
+            sort=[("created_at", -1)],
+            limit=limit,
+        )
+        docs = await cursor.to_list(length=limit)
+        for doc in docs:
+            doc["id"] = str(doc.pop("_id"))
+        return docs
 
     async def append_conversation_messages(
         self,
@@ -1379,6 +1529,8 @@ class AdminStoreMongo:
                     "agents:read", "agents:write",
                     # Chats
                     "chats:read",
+                    # Leads
+                    "leads:read",
                     # Dashboard
                     "dashboard:read",
                 ),

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import random
 import re
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -11,7 +13,14 @@ from pydantic import BaseModel, Field
 from app.core.dependencies import CurrentUser, get_current_user
 from app.models.user import UserRole
 from app.rag_pipeline import RAGPipeline, is_fallback_response
-from app.prompt_builder import is_list_question
+from app.prompt_builder import (
+    detect_pricing_subject,
+    detect_list_category,
+    has_recommendation_requirements,
+    is_list_question,
+    is_pricing_question,
+    is_recommendation_question,
+)
 from app.services.admin_store_mongo import AdminStoreMongo
 from app.services.chunk_store import ChunkStore
 
@@ -21,6 +30,12 @@ router = APIRouter(tags=["chat"])
 # ── Intent Detection ──────────────────────────────────────────────────────────
 
 _INTENT_PATTERNS: dict[str, list[str]] = {
+    "identity": [
+        "who are you", "who r you", "what are you", "what is your name",
+        "what's your name", "whats your name", "your name", "tell me your name",
+        "may i know your name", "can i know your name", "introduce yourself",
+        "who am i talking to", "who am i chatting with", "tell me about yourself",
+    ],
     "greeting": [
         "hi", "hello", "hey", "hi there", "hey there", "hello there",
         "hey bot", "hello bot", "hi bot", "hello?", "hi!", "hey!",
@@ -149,6 +164,63 @@ _CLOSING_INVITATION_ENDINGS = [
     "more about any", "if you need more", "if you have more",
 ]
 
+_DEFAULT_STARTER_SUGGESTIONS = (
+    "What do you offer?",
+    "What are your services?",
+    "What are your products?",
+    "Which solution would you recommend?",
+)
+
+_PRODUCT_TOPIC_RE = re.compile(
+    r"\b(product|products|solution|solutions|platform|platforms|crm|"
+    r"field service|warehouse|inventory|manufacturing|shopfloor|"
+    r"asset tracking|partner portal|partner portals|configurator)\b",
+    re.IGNORECASE,
+)
+_SERVICE_TOPIC_RE = re.compile(
+    r"\b(service|services|consulting|implementation|integration|"
+    r"migration|training|support|maintenance|onboarding|managed service|"
+    r"professional service)\b",
+    re.IGNORECASE,
+)
+_OFFERING_TOPIC_RE = re.compile(
+    r"\b(offer|offers|offering|offerings|provide|provides|what do you do|"
+    r"what can you do)\b",
+    re.IGNORECASE,
+)
+_GENERAL_TOPIC_RE = re.compile(
+    r"\b(about|company|business|who are you|how can you help|get started|"
+    r"contact|overview|background)\b",
+    re.IGNORECASE,
+)
+
+_GREETING_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:good morning|good afternoon|good evening|good night|"
+    r"hello again|hi again|hey again|hi there|hey there|hello there|"
+    r"hello|hi|hey|howdy|greetings|yo)\b[\s,!.?:-]*)+",
+    re.IGNORECASE,
+)
+_TIME_GREETING_PHRASES = (
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "good night",
+)
+_GENERAL_GREETING_PHRASES = (
+    "hello again",
+    "hi again",
+    "hey again",
+    "hello there",
+    "hi there",
+    "hey there",
+    "hello",
+    "hi",
+    "hey",
+    "howdy",
+    "greetings",
+    "yo",
+)
+
 
 def bot_asked_yes_no_question(last_bot_message: str) -> bool:
     if not last_bot_message:
@@ -157,11 +229,113 @@ def bot_asked_yes_no_question(last_bot_message: str) -> bool:
     return any(e in lower for e in _YES_NO_QUESTION_ENDINGS)
 
 
+def _normalize_for_greeting_match(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _phrase_similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def _consume_fuzzy_greeting_phrase(
+    tokens: list[str],
+    start: int,
+    phrases: tuple[str, ...],
+    *,
+    threshold: float,
+) -> int:
+    if start >= len(tokens):
+        return 0
+
+    best_len = 0
+    best_score = 0.0
+    for phrase in phrases:
+        phrase_tokens = phrase.split()
+        end = start + len(phrase_tokens)
+        if end > len(tokens):
+            continue
+        candidate = " ".join(tokens[start:end])
+        score = _phrase_similarity(candidate, phrase)
+        if score >= threshold and score > best_score:
+            best_score = score
+            best_len = len(phrase_tokens)
+    return best_len
+
+
+def _greeting_prefix_token_count(message: str) -> int:
+    normalized = _normalize_for_greeting_match(message)
+    tokens = normalized.split()
+    if not tokens:
+        return 0
+
+    consumed = 0
+    consumed += _consume_fuzzy_greeting_phrase(
+        tokens, consumed, _GENERAL_GREETING_PHRASES, threshold=0.84
+    )
+    consumed += _consume_fuzzy_greeting_phrase(
+        tokens, consumed, _TIME_GREETING_PHRASES, threshold=0.78
+    )
+
+    if consumed == 0:
+        # Allow direct time greeting with a typo, e.g. "goor afternoon".
+        consumed = _consume_fuzzy_greeting_phrase(
+            tokens, 0, _TIME_GREETING_PHRASES, threshold=0.78
+        )
+
+    return consumed
+
+
+def _is_greeting_only_message(message: str) -> bool:
+    normalized = _normalize_for_greeting_match(message)
+    tokens = normalized.split()
+    if not tokens:
+        return False
+    return _greeting_prefix_token_count(message) == len(tokens)
+
+
+def _detect_time_greeting(message: str) -> str | None:
+    normalized = _normalize_for_greeting_match(message)
+    if not normalized:
+        return None
+
+    tokens = normalized.split()
+    for start in range(min(2, len(tokens))):
+        consumed = _consume_fuzzy_greeting_phrase(
+            tokens, start, _TIME_GREETING_PHRASES, threshold=0.78
+        )
+        if not consumed:
+            continue
+        candidate = " ".join(tokens[start:start + consumed])
+        best_phrase = max(
+            _TIME_GREETING_PHRASES,
+            key=lambda phrase: _phrase_similarity(candidate, phrase),
+        )
+        if "morning" in best_phrase:
+            return "morning"
+        if "afternoon" in best_phrase:
+            return "afternoon"
+        if "evening" in best_phrase:
+            return "evening"
+        if "night" in best_phrase:
+            return "night"
+    return None
+
+
 def detect_intent(message: str, last_bot_message: str = "") -> str | None:
     normalized = re.sub(r"[!?.]+$", "", message.strip().lower()).strip()
+    stripped_after_greeting = _strip_greeting_prefix(message)
+    has_non_greeting_content = bool(
+        stripped_after_greeting and stripped_after_greeting != message.strip()
+    )
+
+    if _is_greeting_only_message(message):
+        return "greeting"
 
     if bot_asked_yes_no_question(last_bot_message):
         for intent, patterns in _INTENT_PATTERNS.items():
+            if has_non_greeting_content and intent == "greeting":
+                continue
             if intent in ("followup_affirmation", "followup_negation"):
                 continue
             for p in patterns:
@@ -170,18 +344,319 @@ def detect_intent(message: str, last_bot_message: str = "") -> str | None:
         return None
 
     for intent, patterns in _INTENT_PATTERNS.items():
+        if has_non_greeting_content and intent == "greeting":
+            continue
         for p in patterns:
             if normalized == p or normalized.startswith(p + " ") or normalized.startswith(p + ","):
                 return intent
     return None
 
 
-def handle_intent(intent: str) -> str:
+def _matching_greeting_response(message: str) -> str | None:
+    time_greeting = _detect_time_greeting(message)
+
+    if time_greeting == "morning":
+        return random.choice([
+            "Good morning! How can I help you today?",
+            "Good morning! What can I do for you?",
+            "Good morning! What would you like to know?",
+        ])
+    if time_greeting == "afternoon":
+        return random.choice([
+            "Good afternoon! How can I help you today?",
+            "Good afternoon! What can I do for you?",
+            "Good afternoon! What would you like to know?",
+        ])
+    if time_greeting == "evening":
+        return random.choice([
+            "Good evening! How can I help you today?",
+            "Good evening! What can I do for you?",
+            "Good evening! What would you like to know?",
+        ])
+    if time_greeting == "night":
+        return random.choice([
+            "Good night! I'm here if you need anything before you head off.",
+            "Good night! Let me know if there's anything you'd like help with.",
+        ])
+
+    return None
+
+
+def _resolve_agent_name(agent_doc: dict | None) -> str:
+    if not agent_doc:
+        return "our"
+
+    for key in ("name", "display_name", "website_name"):
+        value = str(agent_doc.get(key) or "").strip()
+        if value:
+            return value
+    return "our"
+
+
+def _identity_response(agent_doc: dict | None) -> str:
+    agent_name = _resolve_agent_name(agent_doc)
+    if agent_name.lower().endswith("ai agent"):
+        full_name = agent_name
+    else:
+        full_name = f"{agent_name} AI agent"
+
+    return (
+        f"I'm {full_name}. I'm here to assist you with any questions related to "
+        f"{agent_name}, and I'll be happy to help in any way I can. "
+        "Please let me know how I may assist you."
+    )
+
+
+def _dedupe_suggestions(items: list[str], *, limit: int = 4) -> list[str]:
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in items:
+        value = str(item or "").strip()
+        key = value.lower()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(value)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def _starter_suggestions(agent_doc: dict | None = None) -> list[str]:
+    return _dedupe_suggestions(list(_DEFAULT_STARTER_SUGGESTIONS))
+
+
+def _detect_topic_from_text(text: str) -> tuple[str | None, str | None]:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return None, None
+
+    if is_pricing_question(lower):
+        return "pricing", detect_pricing_subject(lower)
+
+    list_category = detect_list_category(lower) if is_list_question(lower) else None
+    if list_category:
+        return list_category, None
+
+    if _PRODUCT_TOPIC_RE.search(lower):
+        return "product", None
+    if _SERVICE_TOPIC_RE.search(lower):
+        return "service", None
+    if _OFFERING_TOPIC_RE.search(lower):
+        return "offering", None
+    if _GENERAL_TOPIC_RE.search(lower):
+        return "general", None
+
+    return None, None
+
+
+def _last_non_pricing_topic(conversation_history: list[dict] | None) -> str | None:
+    if not conversation_history:
+        return None
+
+    for msg in reversed(conversation_history):
+        category, _ = _detect_topic_from_text(str(msg.get("content") or ""))
+        if category and category != "pricing":
+            return category
+    return None
+
+
+def _infer_suggestion_topic(
+    question: str,
+    answer: str,
+    conversation_history: list[dict] | None = None,
+) -> tuple[str, str | None]:
+    category, pricing_subject = _detect_topic_from_text(question)
+    if category == "pricing":
+        if pricing_subject:
+            return category, pricing_subject
+        history_topic = _last_non_pricing_topic(conversation_history)
+        if history_topic == "product":
+            return category, "products"
+        if history_topic == "service":
+            return category, "services"
+        if history_topic == "offering":
+            return category, "products and services"
+        answer_category, _ = _detect_topic_from_text(answer)
+        if answer_category == "product":
+            return category, "products"
+        if answer_category == "service":
+            return category, "services"
+        if answer_category == "offering":
+            return category, "products and services"
+        return category, None
+
+    if category:
+        return category, pricing_subject
+
+    answer_category, _ = _detect_topic_from_text(answer)
+    if answer_category and answer_category != "pricing":
+        return answer_category, None
+
+    history_topic = _last_non_pricing_topic(conversation_history)
+    if history_topic:
+        return history_topic, None
+
+    if answer_category == "pricing":
+        return "pricing", None
+
+    return "general", None
+
+
+def _topic_suggestions(
+    category: str,
+    *,
+    question: str,
+    conversation_history: list[dict] | None = None,
+    pricing_subject: str | None = None,
+) -> list[str]:
+    if category == "pricing":
+        if pricing_subject == "products":
+            return _dedupe_suggestions([
+                "Do you have pricing details for your products?",
+                "Can I get a product quote?",
+                "Is product pricing customized?",
+                "What affects product pricing?",
+            ])
+        if pricing_subject == "services":
+            return _dedupe_suggestions([
+                "Do you have pricing details for your services?",
+                "Can I get a service quote?",
+                "Is service pricing customized?",
+                "What affects service pricing?",
+            ])
+        return _dedupe_suggestions([
+            "Do you have pricing details?",
+            "Can I get a quote?",
+            "Is pricing customized?",
+            "What affects the pricing?",
+        ])
+
+    if category == "product":
+        if is_recommendation_question(question) and not has_recommendation_requirements(question, conversation_history):
+            return _dedupe_suggestions([
+                "For customer-facing work",
+                "For sales and growth",
+                "For internal operations",
+                "Not sure yet",
+            ])
+        if is_list_question(question):
+            return _dedupe_suggestions([
+                "Tell me more about the first product",
+                "Which product would you recommend?",
+                "Which product fits our needs?",
+                "How do these products differ?",
+            ])
+        return _dedupe_suggestions([
+            "Tell me more about this product",
+            "What features does this product include?",
+            "How does this product help?",
+            "Is this product the right fit for us?",
+        ])
+
+    if category == "service":
+        if is_recommendation_question(question) and not has_recommendation_requirements(question, conversation_history):
+            return _dedupe_suggestions([
+                "For setup and onboarding",
+                "For integration help",
+                "For training and enablement",
+                "Not sure yet",
+            ])
+        if is_list_question(question):
+            return _dedupe_suggestions([
+                "Tell me more about the first service",
+                "Which service would you recommend?",
+                "What is included in each service?",
+                "How do these services differ?",
+            ])
+        return _dedupe_suggestions([
+            "Tell me more about this service",
+            "What is included in this service?",
+            "How does this service work?",
+            "Is this service the right fit for us?",
+        ])
+
+    if category == "offering":
+        if is_recommendation_question(question) and not has_recommendation_requirements(question, conversation_history):
+            return _dedupe_suggestions([
+                "For customer-facing work",
+                "For internal operations",
+                "For team enablement",
+                "Not sure yet",
+            ])
+        return _dedupe_suggestions([
+            "What are your products?",
+            "What are your services?",
+            "Which option would you recommend?",
+            "How can you help us?",
+        ])
+
+    return _dedupe_suggestions([
+        "What do you offer?",
+        "How can you help?",
+        "Tell me more about your company",
+        "How do I get started?",
+    ])
+
+
+def _build_suggestions(
+    question: str,
+    answer: str,
+    *,
+    agent_doc: dict | None = None,
+    intent: str | None = None,
+    conversation_history: list[dict] | None = None,
+) -> list[str]:
+    if intent in {"greeting", "conversation_restart", "identity", "help_request"}:
+        return _starter_suggestions(agent_doc)
+
+    category, pricing_subject = _infer_suggestion_topic(
+        question,
+        answer,
+        conversation_history=conversation_history,
+    )
+    suggestions = _topic_suggestions(
+        category,
+        question=question,
+        conversation_history=conversation_history,
+        pricing_subject=pricing_subject,
+    )
+
+    if is_fallback_response(answer) and not suggestions:
+        return _starter_suggestions(agent_doc)
+
+    return _dedupe_suggestions(suggestions or _starter_suggestions(agent_doc))
+
+
+def handle_intent(intent: str, message: str = "", agent_doc: dict | None = None) -> str:
     """Enhancement 4: pick a random variant so responses never sound canned."""
+    if intent == "identity":
+        return _identity_response(agent_doc)
+
+    if intent == "greeting":
+        matched = _matching_greeting_response(message)
+        if matched:
+            return matched
+
     variants = _INTENT_RESPONSES.get(intent)
     if variants:
         return random.choice(variants)
     return "How can I help you?"
+
+
+def _strip_greeting_prefix(message: str) -> str:
+    stripped = _GREETING_PREFIX_RE.sub("", message.strip(), count=1).strip()
+    if stripped != message.strip():
+        return stripped
+
+    consume_count = _greeting_prefix_token_count(message)
+    if consume_count <= 0:
+        return message.strip()
+
+    raw_tokens = message.strip().split()
+    if consume_count >= len(raw_tokens):
+        return ""
+    return " ".join(raw_tokens[consume_count:]).strip(" ,.!?:;-")
 
 
 
@@ -215,6 +690,18 @@ _REFERENCE_TRIGGERS = [
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
 ]
 
+_LIST_EXCLUDE_LABEL_PATTERNS = re.compile(
+    r"\b(about|contact|get in touch|terms|privacy|policy|data protection|"
+    r"cookie|careers|blog|news|press|documentation|faq|request a demo|demo)\b",
+    re.IGNORECASE,
+)
+_LIST_EXCLUDE_URL_PATTERNS = re.compile(
+    r"/(about|contact|legal|terms|privacy|cookie|cookies|data-protection|"
+    r"career|careers|blog|blogs|news|press|documentation|docs|faq|faqs|"
+    r"industry|industries|request-demo|demo)/",
+    re.IGNORECASE,
+)
+
 
 def _extract_numbered_items(text: str) -> dict[int, str]:
     """
@@ -229,6 +716,79 @@ def _extract_numbered_items(text: str) -> dict[int, str]:
         if label:
             items[idx] = label
     return items
+
+
+def _extract_summary_label(content: str) -> str:
+    first_line = content.strip().splitlines()[0] if content.strip() else ""
+    if ":" in first_line:
+        prefix, value = first_line.split(":", 1)
+        if prefix.strip().lower() in {"product", "service"}:
+            return value.strip()
+    return ""
+
+
+def _extract_summary_url(content: str) -> str:
+    for line in content.splitlines():
+        if line.lower().startswith("url:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _normalize_summary_label(label: str) -> str:
+    return re.sub(r"\s+", " ", label.strip().lower())
+
+
+def _is_root_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return (parsed.path or "/") == "/"
+
+
+def _should_skip_summary_for_list(content: str, list_category: str | None) -> bool:
+    if not list_category:
+        return False
+
+    label = _extract_summary_label(content)
+    summary_url = _extract_summary_url(content)
+
+    if label and _LIST_EXCLUDE_LABEL_PATTERNS.search(label):
+        return True
+    if summary_url and _LIST_EXCLUDE_URL_PATTERNS.search(summary_url):
+        return True
+
+    # Root/home pages are often catalog or company-overview pages rather than a
+    # single product/service item. Let detail retrieval use them, but don't turn
+    # the homepage title itself into a fake product entry in list answers.
+    if summary_url and _is_root_url(summary_url):
+        return True
+
+    return False
+
+
+def _should_skip_detail_chunk_for_list(source_name: str, list_category: str | None) -> bool:
+    if not list_category:
+        return False
+    if source_name and _is_root_url(source_name):
+        return True
+    return bool(source_name and _LIST_EXCLUDE_URL_PATTERNS.search(source_name))
+
+
+def _list_scope_categories(list_category: str | None) -> list[str]:
+    if list_category == "offering":
+        return ["product", "service"]
+    if list_category in {"product", "service"}:
+        return [list_category]
+    return []
+
+
+def _matches_list_scope(chunk_category: str | None, list_category: str | None) -> bool:
+    if not list_category:
+        return True
+    return (chunk_category or "") in _list_scope_categories(list_category)
 
 
 def resolve_reference_query(question: str, last_bot_message: str) -> str:
@@ -334,12 +894,249 @@ def _get_conversation_history(messages: list, max_turns: int = 3) -> list[dict]:
     return collected
 
 
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_PHONE_RE = re.compile(r"(?:(?:\+?\d[\d\s().-]{7,}\d))")
+_LEAD_INTENT_RE = re.compile(
+    r"\b("
+    r"demo|quote|pricing|price|cost|proposal|contact me|call me|reach me|reach out|follow up|"
+    r"callback|consultation|book|schedule|meeting|sales|purchase|buy|interested|interested in|"
+    r"let'?s talk|talk to someone|get in touch"
+    r")\b",
+    re.I,
+)
+_QUALIFIED_INQUIRY_RE = re.compile(
+    r"\b("
+    r"demo|book a demo|schedule a demo|request a demo|"
+    r"service request|support request|implementation request|"
+    r"customization|customisation|customize|customise|inspection|assessment|audit|site visit|"
+    r"erp customization|erp customisation|erp inspection|erp assessment|erp audit"
+    r")\b",
+    re.I,
+)
+_CONTACT_ONLY_RE = re.compile(
+    r"^\s*(?:"
+    r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|"
+    r"[\d\s().+-]{7,}|"
+    r"my email is .*|my phone is .*|you can reach me .*"
+    r")\s*$",
+    re.I,
+)
+
+
+def _clean_lead_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = " ".join(value.strip().split())
+    return cleaned.strip(" ,.;:-") or None
+
+
+def _is_compact_contact_submission(text: str) -> bool:
+    normalized = " ".join((text or "").strip().split())
+    if not normalized:
+        return False
+
+    email_present = bool(_EMAIL_RE.search(normalized))
+    digit_groups = re.findall(r"\b\d[\d\s().+-]{4,}\d\b|\b\d{6,15}\b", normalized)
+    word_count = len(re.findall(r"[A-Za-z0-9@._%+-]+", normalized))
+
+    return word_count <= 8 and (email_present or bool(digit_groups))
+
+
+def _extract_email(text: str) -> str | None:
+    match = _EMAIL_RE.search(text or "")
+    return match.group(0).lower() if match else None
+
+
+def _extract_phone(text: str) -> str | None:
+    for match in _PHONE_RE.finditer(text or ""):
+        candidate = match.group(0).strip()
+        digits = re.sub(r"\D", "", candidate)
+        if len(digits) >= 7:
+            return candidate
+
+    if _is_compact_contact_submission(text):
+        for match in re.finditer(r"\b\d{6,15}\b", text or ""):
+            candidate = match.group(0).strip()
+            if len(candidate) >= 6:
+                return candidate
+    return None
+
+
+def _looks_like_name(value: str) -> bool:
+    lower = value.lower().strip()
+    if not lower:
+        return False
+    blocked_prefixes = (
+        "interested", "looking", "here", "ready", "need", "want", "from",
+        "available", "contact", "email", "phone", "number", "quote", "demo",
+    )
+    if any(lower.startswith(prefix) for prefix in blocked_prefixes):
+        return False
+    words = [word for word in re.split(r"\s+", value.strip()) if word]
+    if len(words) > 4:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,60}", value.strip()))
+
+
+def _sanitize_name_candidate(value: str | None) -> str | None:
+    candidate = _clean_lead_value(value)
+    if not candidate:
+        return None
+
+    candidate = re.split(
+        r"(?i)\b(?:my email is|email is|you can reach me|reach me at|phone is|mobile is|contact me at|from)\b",
+        candidate,
+        maxsplit=1,
+    )[0]
+    candidate = re.split(r"[,.!;:\n]", candidate, maxsplit=1)[0]
+    candidate = _clean_lead_value(candidate)
+
+    if candidate and _looks_like_name(candidate):
+        return candidate
+    return None
+
+
+def _extract_name(text: str) -> str | None:
+    patterns = (
+        r"\bmy name is\s+([A-Za-z][A-Za-z .'-]{1,80})",
+        r"\bi am\s+([A-Za-z][A-Za-z .'-]{1,80})",
+        r"\bi'm\s+([A-Za-z][A-Za-z .'-]{1,80})",
+        r"\bthis is\s+([A-Za-z][A-Za-z .'-]{1,80})",
+        r"\bname\s*:\s*([A-Za-z][A-Za-z .'-]{1,80})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text or "", re.I)
+        if not match:
+            continue
+        candidate = _sanitize_name_candidate(match.group(1))
+        if candidate:
+            return candidate
+
+    if _is_compact_contact_submission(text):
+        stripped = _EMAIL_RE.sub(" ", text or "")
+        stripped = _PHONE_RE.sub(" ", stripped)
+        stripped = re.sub(r"\b\d{6,15}\b", " ", stripped)
+        stripped = re.sub(r"[^A-Za-z .'-]", " ", stripped)
+        stripped = " ".join(stripped.split())
+        candidate = _sanitize_name_candidate(stripped)
+        if candidate:
+            return candidate
+    return None
+
+
+def _extract_company(text: str) -> str | None:
+    patterns = (
+        r"\b(?:company|organization|organisation|business)\s*(?:name)?\s*(?:is|:)\s*([A-Za-z0-9][A-Za-z0-9 &.,'-]{1,80})",
+        r"\b(?:i am|i'm)\s+from\s+([A-Za-z0-9][A-Za-z0-9 &.,'-]{1,80})",
+        r"\b(?:we are|we're)\s+from\s+([A-Za-z0-9][A-Za-z0-9 &.,'-]{1,80})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text or "", re.I)
+        if not match:
+            continue
+        candidate = _clean_lead_value(match.group(1))
+        if candidate and len(candidate) >= 2:
+            return candidate
+    return None
+
+
+def _extract_interest(user_messages: list[str]) -> str | None:
+    if not user_messages:
+        return None
+    for text in reversed(user_messages):
+        cleaned = _clean_lead_value(_EMAIL_RE.sub("", _PHONE_RE.sub("", text)))
+        if not cleaned or _CONTACT_ONLY_RE.match(cleaned):
+            continue
+        if _LEAD_INTENT_RE.search(cleaned):
+            return cleaned[:220]
+    for text in reversed(user_messages):
+        cleaned = _clean_lead_value(_EMAIL_RE.sub("", _PHONE_RE.sub("", text)))
+        if cleaned and len(cleaned.split()) >= 4 and not _CONTACT_ONLY_RE.match(cleaned):
+            return cleaned[:220]
+    return None
+
+
+def _has_qualified_inquiry(user_messages: list[str]) -> bool:
+    for text in user_messages:
+        cleaned = _clean_lead_value(_EMAIL_RE.sub("", _PHONE_RE.sub("", text)))
+        if cleaned and _QUALIFIED_INQUIRY_RE.search(cleaned):
+            return True
+    return False
+
+
+def _conversation_has_qualified_inquiry(
+    question: str,
+    conversation_history: list[dict] | None = None,
+) -> bool:
+    if _QUALIFIED_INQUIRY_RE.search(question or ""):
+        return True
+    if not conversation_history:
+        return False
+    user_messages = [
+        str(msg.get("content") or "")
+        for msg in conversation_history
+        if msg.get("role") == "user"
+    ]
+    return _has_qualified_inquiry(user_messages)
+
+
+async def _maybe_capture_lead(
+    *,
+    store: AdminStoreMongo,
+    settings: dict,
+    tenant_id: str,
+    agent_id: str,
+    conversation: dict,
+    source: str,
+) -> None:
+    if not settings.get("lead_capture_enabled"):
+        return
+
+    messages = conversation.get("messages", [])
+    user_messages = [
+        str(msg.get("content") or "").strip()
+        for msg in messages
+        if msg.get("role") == "user" and str(msg.get("content") or "").strip()
+    ]
+    if not user_messages:
+        return
+
+    email = None
+    phone = None
+    name = None
+    company = None
+    for text in user_messages:
+        email = email or _extract_email(text)
+        phone = phone or _extract_phone(text)
+        name = name or _extract_name(text)
+        company = company or _extract_company(text)
+
+    qualified_inquiry = _has_qualified_inquiry(user_messages)
+    if not email and not phone and not qualified_inquiry:
+        return
+
+    interest = _extract_interest(user_messages)
+    await store.upsert_lead(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        conversation_id=conversation["id"],
+        source=source,
+        name=name,
+        email=email,
+        phone=phone,
+        company=company,
+        interest=interest,
+        notes=interest,
+    )
+
+
 async def _build_context(
     pipeline: RAGPipeline,
     question: str,
     cs: ChunkStore,
     loop: asyncio.AbstractEventLoop,
     agent_id: str = "",
+    conversation_history: list[dict] | None = None,
 ) -> list[dict]:
     """
     Build context chunks for the LLM.
@@ -360,13 +1157,30 @@ async def _build_context(
     Detail chunks from vector search fill the remaining slots with richer info.
     """
     # ── Step 1a: fetch summary chunks from MongoDB for list questions ─────────
+    is_list_query = is_list_question(question)
+    list_category = detect_list_category(question) if is_list_query else None
+
+    scoped_categories = _list_scope_categories(list_category)
     summary_context: list[dict] = []
-    if agent_id and is_list_question(question):
-        summary_ids = await cs.get_summary_chunk_ids_by_agent(agent_id)
+    seen_summary_labels: set[str] = set()
+    if agent_id and is_list_query:
+        summary_ids = await cs.get_summary_chunk_ids_by_agent(
+            agent_id,
+            category=list_category if list_category in {"product", "service"} else None,
+        )
         if summary_ids:
             summary_chunks = await cs.get_chunks_by_ids(summary_ids)
             for c in summary_chunks:
+                if not _matches_list_scope(c.get("category"), list_category):
+                    continue
                 content = c.get("content", "").strip()
+                if _should_skip_summary_for_list(content, list_category):
+                    continue
+                summary_label = _normalize_summary_label(_extract_summary_label(content))
+                if summary_label:
+                    if summary_label in seen_summary_labels:
+                        continue
+                    seen_summary_labels.add(summary_label)
                 if content:
                     summary_context.append({
                         "content": content,
@@ -382,7 +1196,7 @@ async def _build_context(
     # NOTE: Files (PDFs, DOCX, etc.) and general website pages are covered by
     # the vector search in step 2 which uses a 3× retrieval limit + lower
     # threshold for list questions, ensuring broad knowledge base coverage.
-    if agent_id and is_list_question(question):
+    if agent_id and is_list_query and list_category is None:
         manual_chunks = await cs.get_text_snippet_and_qa_chunks_by_agent(agent_id)
         seen_manual: set[str] = {c["content"] for c in summary_context}
         for c in manual_chunks:
@@ -394,25 +1208,125 @@ async def _build_context(
                     "source_name": c.get("source_name", "unknown"),
                 })
 
-    # ── Step 2: normal vector search for detail chunks ────────────────────────
-    new_style_ids, legacy_chunks = await loop.run_in_executor(
-        None, lambda: pipeline.search_chunks(question)
-    )
-    detail_context: list[dict] = list(legacy_chunks)
-    seen_content: set[str] = {c["content"] for c in summary_context}
-    if new_style_ids:
-        mongo_chunks = await cs.get_chunks_by_ids(new_style_ids)
-        for c in mongo_chunks:
-            content = c.get("content", "").strip()
-            # Skip detail chunks that duplicate a summary chunk already added
-            if content and content not in seen_content:
-                detail_context.append({
+    # Step 1c: pin category-matching non-website detail chunks first.
+    # Uploaded files are often cleaner than website pages and may contain the
+    # only structured service/product catalog for an agent. Always include a
+    # few of those chunks for list-style category questions.
+    pinned_category_details: list[dict] = []
+    if agent_id and is_list_query and scoped_categories:
+        seen_pinned: set[str] = {c["content"] for c in summary_context}
+        for category_name in scoped_categories:
+            curated_category_details = await cs.get_detail_chunks_by_agent_and_category(
+                agent_id,
+                category=category_name,
+                limit=8,
+                exclude_source_types=["website"],
+            )
+            for c in curated_category_details:
+                content = str(c.get("content") or "").strip()
+                source_name = str(c.get("source_name") or "unknown")
+                if not content or content in seen_pinned:
+                    continue
+                if _should_skip_detail_chunk_for_list(source_name, list_category):
+                    continue
+                seen_pinned.add(content)
+                pinned_category_details.append({
                     "content": content,
-                    "source_name": c.get("source_name", "unknown"),
+                    "source_name": source_name,
                 })
 
-    # Summary chunks (+ pinned manual knowledge) first, then detail chunks
-    return summary_context + detail_context
+    # Step 1d: stable website fallback for product/service lists.
+    # If summary chunks are missing or too sparse, pin website detail chunks
+    # from Mongo so list answers do not depend on a single vector hit.
+    if agent_id and is_list_query and scoped_categories and len(summary_context) < 2:
+        seen_pinned: set[str] = {c["content"] for c in summary_context}
+        seen_pinned.update(c["content"] for c in pinned_category_details)
+        per_category_limit = 10 if len(scoped_categories) > 1 else 20
+        for category_name in scoped_categories:
+            website_category_details = await cs.get_detail_chunks_by_agent_and_category(
+                agent_id,
+                category=category_name,
+                limit=per_category_limit,
+                source_types=["website"],
+            )
+            for c in website_category_details:
+                content = str(c.get("content") or "").strip()
+                source_name = str(c.get("source_name") or "unknown")
+                if not content or content in seen_pinned:
+                    continue
+                if _should_skip_detail_chunk_for_list(source_name, list_category):
+                    continue
+                seen_pinned.add(content)
+                pinned_category_details.append({
+                    "content": content,
+                    "source_name": source_name,
+                })
+
+    # ── Step 2: normal vector search for detail chunks ────────────────────────
+    # For explicit product/service listing questions, summary chunks are the
+    # canonical list representation. Once we already have summary-based list
+    # context (or pinned category detail fallback), extra vector detail chunks
+    # tend to introduce noisy non-item pages like homepages into the list.
+    should_include_vector_details = (
+        list_category is None
+        or (not summary_context and not pinned_category_details)
+    )
+
+    detail_context: list[dict] = []
+    if should_include_vector_details:
+        new_style_ids, legacy_chunks = await loop.run_in_executor(
+            None, lambda: pipeline.search_chunks(question)
+        )
+        detail_context = [] if list_category else list(legacy_chunks)
+        seen_content: set[str] = {c["content"] for c in summary_context}
+        seen_content.update(c["content"] for c in pinned_category_details)
+        if new_style_ids:
+            mongo_chunks = await cs.get_chunks_by_ids(new_style_ids)
+            for c in mongo_chunks:
+                if not _matches_list_scope(c.get("category"), list_category):
+                    continue
+                source_name = c.get("source_name", "unknown")
+                if _should_skip_detail_chunk_for_list(str(source_name), list_category):
+                    continue
+                content = c.get("content", "").strip()
+                # Skip detail chunks that duplicate a summary chunk already added
+                if content and content not in seen_content:
+                    detail_context.append({
+                        "content": content,
+                        "source_name": source_name,
+                    })
+
+    # Summary chunks first, then pinned category details, then vector details.
+    contact_context: list[dict] = []
+    should_pin_contact_details = (
+        bool(agent_id)
+        and (
+            is_pricing_question(question)
+            or (
+                is_recommendation_question(question)
+                and has_recommendation_requirements(question, conversation_history)
+            )
+            or _conversation_has_qualified_inquiry(question, conversation_history)
+        )
+    )
+    if should_pin_contact_details:
+        seen_contact_content: set[str] = {c["content"] for c in summary_context}
+        seen_contact_content.update(c["content"] for c in pinned_category_details)
+        seen_contact_content.update(c["content"] for c in detail_context)
+        contact_chunks = await cs.get_contact_chunks_by_agent(agent_id, limit=4)
+        for c in contact_chunks:
+            content = str(c.get("content") or "").strip()
+            if not content or content in seen_contact_content:
+                continue
+            seen_contact_content.add(content)
+            contact_context.append({
+                "content": content,
+                "source_name": c.get("source_name", "unknown"),
+            })
+
+    # Summary chunks first, then pinned category details, then vector details,
+    # and finally contact chunks when needed for grounded handoff details.
+    return summary_context + pinned_category_details + detail_context + contact_context
 
 
 async def route_to_llm(
@@ -425,7 +1339,14 @@ async def route_to_llm(
     agent_id: str = "",
 ) -> str:
     if chunk_store is not None:
-        context = await _build_context(pipeline, question, chunk_store, loop, agent_id=agent_id)
+        context = await _build_context(
+            pipeline,
+            question,
+            chunk_store,
+            loop,
+            agent_id=agent_id,
+            conversation_history=conversation_history,
+        )
     else:
         context = []
     _ctx = context
@@ -437,6 +1358,7 @@ async def route_to_llm(
             temperature=settings.get("temperature", 0.2),
             conversation_history=conversation_history,
             prefetched_context=_ctx,
+            lead_capture_enabled=bool(settings.get("lead_capture_enabled")),
         ),
     )
 
@@ -470,6 +1392,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     conversation_id: str
+    suggestions: list[str] = Field(default_factory=list)
 
 
 # ── Protected chat ────────────────────────────────────────────────────────────
@@ -501,7 +1424,8 @@ async def chat(
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    question = request.question.strip()
+    raw_question = request.question.strip()
+    question = _strip_greeting_prefix(raw_question) or raw_question
 
     # Load full conversation history from MongoDB
     conversation_history: list[dict] = []
@@ -550,7 +1474,7 @@ async def chat(
 
     if intent:
         await asyncio.sleep(0.6)
-        answer = handle_intent(intent)
+        answer = handle_intent(intent, question, agent_doc=agent_doc)
     else:
         pipeline = _build_pipeline(store, request.agent_id)
         try:
@@ -565,7 +1489,7 @@ async def chat(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     # Enhancement 7: accurate token counting via tiktoken
-    input_tokens   = _count_tokens(question)
+    input_tokens   = _count_tokens(raw_question)
     output_tokens  = _count_tokens(answer)
     summary_tokens = 150
 
@@ -585,7 +1509,7 @@ async def chat(
             await store.log_fallback(
                 agent_id=request.agent_id,
                 tenant_id=tenant_id,
-                question=question,
+                question=raw_question,
                 conversation_id=request.conversation_id,
             )
         except Exception:
@@ -595,11 +1519,29 @@ async def chat(
         agent_id=request.agent_id,
         tenant_id=tenant_id,
         user_id=user.id,
-        user_message=question,
+        user_message=raw_question,
         assistant_message=answer,
         conversation_id=request.conversation_id,
     )
-    return ChatResponse(answer=answer, conversation_id=conversation["id"])
+    try:
+        await _maybe_capture_lead(
+            store=store,
+            settings=settings,
+            tenant_id=tenant_id,
+            agent_id=request.agent_id,
+            conversation=conversation,
+            source="chat",
+        )
+    except Exception:
+        pass
+    suggestions = _build_suggestions(
+        question,
+        answer,
+        agent_doc=agent_doc,
+        intent=intent,
+        conversation_history=conversation_history,
+    )
+    return ChatResponse(answer=answer, conversation_id=conversation["id"], suggestions=suggestions)
 
 
 # ── Enhancement 3: Streaming protected chat ───────────────────────────────────
@@ -637,7 +1579,8 @@ async def chat_stream(
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    question = request.question.strip()
+    raw_question = request.question.strip()
+    question = _strip_greeting_prefix(raw_question) or raw_question
 
     conversation_history: list[dict] = []
     last_bot_message = ""
@@ -662,7 +1605,7 @@ async def chat_stream(
 
     if intent:
         # For intent responses just stream the single string immediately
-        answer_text = handle_intent(intent)
+        answer_text = handle_intent(intent, question, agent_doc=agent_doc)
 
         async def intent_stream():
             yield f"data: {answer_text}\n\n"
@@ -671,7 +1614,14 @@ async def chat_stream(
         return StreamingResponse(intent_stream(), media_type="text/event-stream")
 
     # Build context in async land before entering the sync generator
-    context = await _build_context(pipeline, question, cs, loop, agent_id=request.agent_id)
+    context = await _build_context(
+        pipeline,
+        question,
+        cs,
+        loop,
+        agent_id=request.agent_id,
+        conversation_history=conversation_history,
+    )
     full_answer_parts: list[str] = []
 
     async def token_stream():
@@ -684,6 +1634,7 @@ async def chat_stream(
                     temperature=settings.get("temperature", 0.2),
                     conversation_history=conversation_history,
                     prefetched_context=context,
+                    lead_capture_enabled=bool(settings.get("lead_capture_enabled")),
                 ),
             )
             for token in gen:
@@ -702,7 +1653,7 @@ async def chat_stream(
                     await store.consume_tokens(
                         user_id=user.id,
                         agent_id=request.agent_id,
-                        input_tokens=_count_tokens(question),
+                        input_tokens=_count_tokens(raw_question),
                         output_tokens=_count_tokens(full_answer),
                         summary_tokens=150,
                     )
@@ -710,16 +1661,24 @@ async def chat_stream(
                         await store.log_fallback(
                             agent_id=request.agent_id,
                             tenant_id=tenant_id,
-                            question=question,
+                            question=raw_question,
                             conversation_id=request.conversation_id,
                         )
-                    await store.append_conversation_messages(
+                    conversation = await store.append_conversation_messages(
                         agent_id=request.agent_id,
                         tenant_id=tenant_id,
                         user_id=user.id,
-                        user_message=question,
+                        user_message=raw_question,
                         assistant_message=full_answer,
                         conversation_id=request.conversation_id,
+                    )
+                    await _maybe_capture_lead(
+                        store=store,
+                        settings=settings,
+                        tenant_id=tenant_id,
+                        agent_id=request.agent_id,
+                        conversation=conversation,
+                        source="chat",
                     )
                 except Exception:
                     pass
@@ -748,7 +1707,9 @@ async def widget_chat(
             raise HTTPException(status_code=402, detail="This service is currently unavailable.")
 
     tenant_id = agent_doc["tenant_id"]
-    question  = request.question.strip()
+    settings = await store.get_settings(request.agent_id, tenant_id)
+    raw_question = request.question.strip()
+    question  = _strip_greeting_prefix(raw_question) or raw_question
 
     # Load full conversation history from MongoDB
     conversation_history: list[dict] = []
@@ -794,9 +1755,8 @@ async def widget_chat(
 
     if intent:
         await asyncio.sleep(0.6)
-        answer = handle_intent(intent)
+        answer = handle_intent(intent, question, agent_doc=agent_doc)
     else:
-        settings = await store.get_settings(request.agent_id, tenant_id)
         pipeline = _build_pipeline(store, request.agent_id)
         try:
             loop = asyncio.get_event_loop()
@@ -815,7 +1775,7 @@ async def widget_chat(
             await store.log_fallback(
                 agent_id=request.agent_id,
                 tenant_id=tenant_id,
-                question=question,
+                question=raw_question,
                 conversation_id=request.conversation_id,
             )
         except Exception:
@@ -825,11 +1785,29 @@ async def widget_chat(
         agent_id=request.agent_id,
         tenant_id=tenant_id,
         user_id="widget",
-        user_message=question,
+        user_message=raw_question,
         assistant_message=answer,
         conversation_id=request.conversation_id,
     )
-    return ChatResponse(answer=answer, conversation_id=conversation["id"])
+    try:
+        await _maybe_capture_lead(
+            store=store,
+            settings=settings,
+            tenant_id=tenant_id,
+            agent_id=request.agent_id,
+            conversation=conversation,
+            source="widget",
+        )
+    except Exception:
+        pass
+    suggestions = _build_suggestions(
+        question,
+        answer,
+        agent_doc=agent_doc,
+        intent=intent,
+        conversation_history=conversation_history,
+    )
+    return ChatResponse(answer=answer, conversation_id=conversation["id"], suggestions=suggestions)
 
 
 # ── Widget settings (public) ──────────────────────────────────────────────────
@@ -839,6 +1817,7 @@ class PublicSettingsResponse(BaseModel):
     welcome_message: str
     primary_color: str
     appearance: str
+    suggestions: list[str] = Field(default_factory=list)
 
 
 @router.get("/widget/settings/{agent_id}", response_model=PublicSettingsResponse)
@@ -855,4 +1834,5 @@ async def widget_settings(
         welcome_message=s.get("welcome_message") or "Hi! What can I help you with?",
         primary_color=s.get("primary_color") or "#0f172a",
         appearance=s.get("appearance") or "light",
+        suggestions=_starter_suggestions(agent_doc),
     )

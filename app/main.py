@@ -27,7 +27,7 @@ from app.recrawl_log_store import RecrawlLogEntry, RecrawlLogStore
 from app.models.user import UserRole
 from app.services.admin_store_mongo import AdminStoreMongo
 from app.services.chunk_store import ChunkStore
-from app.routes import auth, agents, documents, chat, dashboard, roles, users, plans, billing
+from app.routes import auth, agents, documents, chat, dashboard, roles, users, plans, billing, leads
 
 # Global instances — injected into routes via dependency functions
 store: AdminStoreMongo | None = None
@@ -173,6 +173,7 @@ app.include_router(roles.router)
 app.include_router(users.router)
 app.include_router(plans.router)
 app.include_router(billing.router)
+app.include_router(leads.router)
 
 
 @app.get("/health")
@@ -388,6 +389,8 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
                     source_name=page.url or url,
                     text=page_input,
                     category=page_category,
+                    page_title=page.title,
+                    page_url=page.url,
                 )
                 indexed += 1
                 if not display_name or display_name == url:
@@ -523,6 +526,8 @@ async def _run_single_page_crawl(
                 source_name=page.url or str(document.get("source_url") or ""),
                 text=page_input,
                 category=page_category,
+                page_title=page.title,
+                page_url=page.url,
             )
 
         # Persist the updated page URL list to MongoDB so the Knowledge tab
@@ -732,6 +737,8 @@ async def _run_single_url_crawl(
             source_name=page.url,
             text=page_input,
             category=page_category,
+            page_title=page.title,
+            page_url=page.url,
         )
 
         doc = await store.upsert_website_source(
@@ -847,7 +854,15 @@ async def get_crawl_job(
 @app.get("/widget.js")
 async def serve_widget():
     widget_path = os.path.join(os.path.dirname(__file__), "..", "public", "widget.js")
-    return FileResponse(widget_path, media_type="application/javascript")
+    return FileResponse(
+        widget_path,
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # ── Scheduled auto re-crawl ────────────────────────────────────────────────────
@@ -1129,6 +1144,8 @@ async def _run_scheduled_recrawl() -> None:
                                 source_name=page.url or source_url,
                                 text=page_input,
                                 category=page_category,
+                                page_title=page.title,
+                                page_url=page.url,
                             )
                         if not display_name or display_name == source_url:
                             display_name = batch[0].title or source_url

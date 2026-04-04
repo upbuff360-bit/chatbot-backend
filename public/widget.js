@@ -4,31 +4,47 @@
   function init() {
   const config = window.chatbotConfig || {};
   const agentId      = config.agentId      || "";
-  const primaryColor = config.primaryColor || "#0f172a";
-  const appearance   = config.appearance   || "light";
+  let currentPrimaryColor = config.primaryColor || "#0f172a";
+  let currentAppearance   = config.appearance   || "light";
   const apiBase      = config.apiBase      || "http://127.0.0.1:8001";
   const position     = config.position     || "bottom-right";
   const STORAGE_KEY  = "cw_history_" + agentId;
 
   if (!agentId) { console.warn("[ChatWidget] agentId is required"); return; }
 
-  const isDark       = appearance === "dark";
-  const bgColor      = isDark ? "#0f172a" : "#ffffff";
-  const textColor    = isDark ? "#f1f5f9" : "#1e293b";
-  const bubbleBg     = isDark ? "#1e293b" : "#f1f5f9";
-  const bubbleBorder = isDark ? "#334155" : "#e2e8f0";
-  const inputBg      = isDark ? "#1e293b" : "#f8fafc";
-  const inputBorder  = isDark ? "#334155" : "#e2e8f0";
-  const subText      = isDark ? "#94a3b8" : "#64748b";
-  const dividerColor = isDark ? "#334155" : "#e2e8f0";
-  const dividerText  = isDark ? "#64748b"  : "#94a3b8";
+  let isDark;
+  let bgColor;
+  let textColor;
+  let bubbleBg;
+  let bubbleBorder;
+  let inputBg;
+  let inputBorder;
+  let subText;
+  let dividerColor;
+  let dividerText;
   const posRight     = position === "bottom-right";
 
+  function updateThemeTokens() {
+    isDark = currentAppearance === "dark";
+    bgColor = isDark ? "#0f172a" : "#ffffff";
+    textColor = isDark ? "#f1f5f9" : "#1e293b";
+    bubbleBg = isDark ? "#1e293b" : "#f1f5f9";
+    bubbleBorder = isDark ? "#334155" : "#e2e8f0";
+    inputBg = isDark ? "#1e293b" : "#f8fafc";
+    inputBorder = isDark ? "#334155" : "#e2e8f0";
+    subText = isDark ? "#94a3b8" : "#64748b";
+    dividerColor = isDark ? "#334155" : "#e2e8f0";
+    dividerText = isDark ? "#64748b" : "#94a3b8";
+  }
+
+  updateThemeTokens();
+
   // ── CSS ───────────────────────────────────────────────────────────────────────
-  const css = `
+  function buildCss() {
+    return `
     #cw-bubble {
       position:fixed;${posRight?"right:24px":"left:24px"};bottom:24px;
-      width:52px;height:52px;border-radius:50%;background:${primaryColor};
+      width:52px;height:52px;border-radius:50%;background:${currentPrimaryColor};
       border:none;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25);
       display:flex;align-items:center;justify-content:center;
       z-index:2147483646;transition:transform .2s,box-shadow .2s;
@@ -47,7 +63,7 @@
     #cw-panel.open{display:flex;}
 
     #cw-header {
-      padding:14px 16px;background:${primaryColor};
+      padding:14px 16px;background:${currentPrimaryColor};
       display:flex;align-items:center;justify-content:space-between;flex-shrink:0;
     }
     #cw-header-left{display:flex;align-items:center;gap:10px;}
@@ -94,8 +110,18 @@
     .cw-msg.user{align-self:flex-end;justify-content:flex-end;}
     .cw-msg.bot{align-self:flex-start;}
     .cw-bubble-text{padding:9px 13px;font-size:13px;line-height:1.55;font-family:system-ui,sans-serif;white-space:pre-wrap;word-break:break-word;}
-    .cw-msg.user .cw-bubble-text{background:${primaryColor};color:#fff;border-radius:16px 16px 4px 16px;}
+    .cw-msg.user .cw-bubble-text{background:${currentPrimaryColor};color:#fff;border-radius:16px 16px 4px 16px;}
     .cw-msg.bot  .cw-bubble-text{background:${bubbleBg};color:${textColor};border:1px solid ${bubbleBorder};border-radius:4px 16px 16px 16px;}
+    .cw-bot-stack{display:flex;flex-direction:column;gap:8px;max-width:84%;}
+    .cw-suggestions{display:flex;flex-wrap:wrap;gap:8px;margin-left:2px;}
+    .cw-chip{
+      border:1px solid ${bubbleBorder};background:${bgColor};color:${textColor};
+      border-radius:999px;padding:6px 11px;font-size:12px !important;line-height:1.25;
+      font-family:system-ui,sans-serif;cursor:pointer;transition:all .15s;
+      box-shadow:0 1px 2px rgba(0,0,0,.04);
+    }
+    .cw-chip:hover{border-color:${currentPrimaryColor};color:${currentPrimaryColor};transform:translateY(-1px);}
+    .cw-chip:disabled{opacity:.55;cursor:not-allowed;transform:none;}
 
     .cw-typing{display:flex;align-items:center;gap:4px;padding:10px 14px;background:${bubbleBg};border:1px solid ${bubbleBorder};border-radius:4px 16px 16px 16px;align-self:flex-start;}
     .cw-dot{width:6px;height:6px;border-radius:50%;background:${subText};animation:cw-bounce .9s infinite;}
@@ -112,7 +138,7 @@
       flex-shrink:0;display:flex;align-items:center;justify-content:space-between;
     }
     #cw-history-new{
-      display:flex;align-items:center;gap:5px;background:${primaryColor};
+      display:flex;align-items:center;gap:5px;background:${currentPrimaryColor};
       color:#fff;border:none;border-radius:8px;padding:5px 10px;
       font-size:11px;font-weight:600;font-family:system-ui,sans-serif;
       cursor:pointer;transition:opacity .15s;
@@ -127,13 +153,13 @@
     .cw-hist-empty{padding:40px 14px;text-align:center;font-size:13px;color:${subText};font-family:system-ui,sans-serif;}
 
     #cw-powered{text-align:center;font-size:10px;color:${subText};padding:4px 0;background:${bgColor};border-top:1px solid ${bubbleBorder};font-family:system-ui,sans-serif;flex-shrink:0;}
-#cw-powered a{color:${primaryColor};text-decoration:none;font-weight:600;}
+#cw-powered a{color:${currentPrimaryColor};text-decoration:none;font-weight:600;}
 #cw-powered a:hover{text-decoration:underline;}
     #cw-input-row{display:flex;align-items:center;gap:8px;padding:10px 12px;background:${bgColor};border-top:1px solid ${bubbleBorder};flex-shrink:0;}
     #cw-input{flex:1;border:1px solid ${inputBorder};background:${inputBg};color:${textColor};border-radius:20px;padding:8px 14px;font-size:13px;font-family:system-ui,sans-serif;outline:none;transition:border-color .15s;}
-    #cw-input:focus{border-color:${primaryColor};}
+    #cw-input:focus{border-color:${currentPrimaryColor};}
     #cw-input::placeholder{color:${subText};}
-    #cw-send{width:34px;height:34px;border-radius:50%;background:${primaryColor};border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:opacity .15s;}
+    #cw-send{width:34px;height:34px;border-radius:50%;background:${currentPrimaryColor};border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:opacity .15s;}
     #cw-send:disabled{opacity:.4;cursor:not-allowed;}
     #cw-send svg{width:16px;height:16px;color:#fff;}
 
@@ -155,7 +181,7 @@
     .cw-confirm-cancel:hover{background:${bubbleBg};}
     .cw-confirm-ok{
       flex:1;padding:8px;border:none;border-radius:8px;
-      background:${primaryColor};color:#fff;
+      background:${currentPrimaryColor};color:#fff;
       font-size:12px;font-weight:600;cursor:pointer;
       font-family:system-ui,sans-serif;transition:opacity .12s;
     }
@@ -166,9 +192,15 @@
       #cw-bubble{${posRight?"right:16px":"left:16px"};bottom:16px;}
     }
   `;
+  }
   const style = document.createElement("style");
-  style.textContent = css;
+  style.textContent = buildCss();
   document.head.appendChild(style);
+  function renderTheme() {
+    updateThemeTokens();
+    style.textContent = buildCss();
+    applyPreviewTheme();
+  }
 
   // ── DOM ───────────────────────────────────────────────────────────────────────
   const bubble = document.createElement("button");
@@ -244,11 +276,18 @@
   // Preview bubble
   const preview = document.createElement("div");
   preview.id = "cw-preview";
-  preview.style.cssText = `position:fixed;${posRight?"right:30px":"left:80px"};bottom:90px;max-width:260px;background:#ffffff;color:#1e293b;font-family:system-ui,sans-serif;font-size:13px;line-height:1.5;padding:10px 14px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.18);cursor:pointer;z-index:2147483645;border:1px solid #e2e8f0;opacity:0;transform:translateY(8px) scale(0.95);transition:opacity .3s,transform .3s;word-break:break-word;`;
+  preview.style.cssText = `position:fixed;${posRight?"right:30px":"left:80px"};bottom:90px;max-width:260px;background:${bgColor};color:${textColor};font-family:system-ui,sans-serif;font-size:13px;line-height:1.5;padding:10px 14px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.18);cursor:pointer;z-index:2147483645;border:1px solid ${bubbleBorder};opacity:0;transform:translateY(8px) scale(0.95);transition:opacity .3s,transform .3s;word-break:break-word;`;
   const previewClose = document.createElement("button");
   previewClose.innerHTML = "&#x2715;";
-  previewClose.style.cssText = `position:absolute;top:-8px;right:-8px;width:20px;height:20px;border-radius:50%;background:#64748b;border:none;color:#fff;font-size:9px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;z-index:1;`;
+  previewClose.style.cssText = `position:absolute;top:-8px;right:-8px;width:20px;height:20px;border-radius:50%;background:${subText};border:none;color:#fff;font-size:9px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;z-index:1;`;
   preview.appendChild(previewClose);
+
+  function applyPreviewTheme() {
+    preview.style.background = bgColor;
+    preview.style.color = textColor;
+    preview.style.border = `1px solid ${bubbleBorder}`;
+    previewClose.style.background = subText;
+  }
 
   document.body.appendChild(bubble);
   document.body.appendChild(preview);
@@ -260,6 +299,12 @@
   let conversationId  = null;
   let _localSessionId = "local_" + Date.now(); // stable ID for this session
   let _welcomeMsg     = "Hi! What can I help you with?";
+  let _starterSuggestions = [
+    "What do you offer?",
+    "How can you help?",
+    "Tell me more about your company",
+    "How do I get started?",
+  ];
   let _lastDay        = "";
   let _showingHistory = false;
 
@@ -301,7 +346,7 @@
       conversationId: conversationId || null, // keep for reference
       title:        messages.find(m => m.role === "user")?.text || "Chat session",
       updatedAt:    new Date().toISOString(),
-      messages:     messages.map(m => ({ role: m.role, text: m.text, timestamp: m.timestamp })),
+      messages:     messages.map(m => ({ role: m.role, text: m.text, timestamp: m.timestamp, suggestions: m.suggestions || [] })),
     };
     if (existing >= 0) history[existing] = session;
     else history.unshift(session);
@@ -340,8 +385,69 @@
     messagesEl.appendChild(d);
   }
 
+  function normalizeSuggestions(suggestions) {
+    if (!Array.isArray(suggestions)) return [];
+    const seen = new Set();
+    const cleaned = [];
+    for (const item of suggestions) {
+      const value = String(item || "").trim();
+      const key = value.toLowerCase();
+      if (!value || seen.has(key)) continue;
+      seen.add(key);
+      cleaned.push(value);
+      if (cleaned.length >= 4) break;
+    }
+    return cleaned;
+  }
+
+  function getLastBotMessage() {
+    for (let i = _sessionMessages.length - 1; i >= 0; i -= 1) {
+      const message = _sessionMessages[i];
+      if (message && message.role === "bot" && message.text) {
+        return String(message.text).trim();
+      }
+    }
+    return "";
+  }
+
+  function renderSuggestionChips(suggestions) {
+    const items = normalizeSuggestions(suggestions);
+    if (!items.length) return null;
+
+    const wrap = document.createElement("div");
+    wrap.className = "cw-suggestions";
+
+    items.forEach((label) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "cw-chip";
+      chip.textContent = label;
+      chip.addEventListener("click", () => {
+        if (isLoading) return;
+        inputEl.value = label;
+        sendMessage(label);
+      });
+      wrap.appendChild(chip);
+    });
+
+    return wrap;
+  }
+
+  function withFallbackSuggestions(role, text, suggestions) {
+    const normalized = normalizeSuggestions(suggestions);
+    if (role !== "bot" || normalized.length) return normalized;
+
+    const message = String(text || "").trim();
+    if (!message) return normalized;
+
+    if (message === _welcomeMsg || /^hi[!,. ]|^hello[!,. ]|^good (morning|afternoon|evening)/i.test(message)) {
+      return normalizeSuggestions(_starterSuggestions);
+    }
+    return normalized;
+  }
+
   // ── Message helpers ───────────────────────────────────────────────────────────
-  function addMessage(role, text, timestamp) {
+  function addMessage(role, text, timestamp, suggestions) {
     const now = timestamp ? new Date(timestamp) : new Date();
     _insertDayDivider(now);
 
@@ -365,10 +471,11 @@
     timeEl.title = now.toLocaleString();
     timeEl.style.cssText = `margin:4px 0 0;font-size:10px;opacity:0.55;text-align:${role==="user"?"right":"left"};font-family:system-ui,sans-serif;`;
     timeEl.textContent = _timeAgo(now);
+    const messageSuggestions = withFallbackSuggestions(role, text, suggestions);
 
     if (!timestamp) {
       // Save immediately for both user and bot messages
-      _sessionMessages.push({ role, text, timestamp: now.toISOString() });
+      _sessionMessages.push({ role, text, timestamp: now.toISOString(), suggestions: messageSuggestions });
       saveCurrentSession(_sessionMessages);
       const timer = setInterval(() => { timeEl.textContent = _timeAgo(now); }, 60000);
       setTimeout(() => clearInterval(timer), 3600000);
@@ -376,13 +483,22 @@
 
     bub.appendChild(textEl);
     bub.appendChild(timeEl);
-    wrap.appendChild(bub);
+    if (role === "bot" && messageSuggestions.length) {
+      const stack = document.createElement("div");
+      stack.className = "cw-bot-stack";
+      stack.appendChild(bub);
+      const chipWrap = renderSuggestionChips(messageSuggestions);
+      if (chipWrap) stack.appendChild(chipWrap);
+      wrap.appendChild(stack);
+    } else {
+      wrap.appendChild(bub);
+    }
     messagesEl.appendChild(wrap);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return wrap;
   }
 
-  function typeMessage(role, text) {
+  function typeMessage(role, text, suggestions) {
     const now = new Date();
     _insertDayDivider(now);
 
@@ -402,11 +518,21 @@
     timeEl.textContent = _timeAgo(now);
     bub.appendChild(timeEl);
 
-    wrap.appendChild(bub);
+    const messageSuggestions = withFallbackSuggestions(role, text, suggestions);
+    let chipWrap = null;
+    if (role === "bot" && messageSuggestions.length) {
+      const stack = document.createElement("div");
+      stack.className = "cw-bot-stack";
+      stack.appendChild(bub);
+      chipWrap = renderSuggestionChips(messageSuggestions);
+      wrap.appendChild(stack);
+    } else {
+      wrap.appendChild(bub);
+    }
     messagesEl.appendChild(wrap);
 
     // Save to session immediately — don't wait for typing to finish
-    _sessionMessages.push({ role, text, timestamp: now.toISOString() });
+    _sessionMessages.push({ role, text, timestamp: now.toISOString(), suggestions: messageSuggestions });
     saveCurrentSession(_sessionMessages);
 
     // Type characters one by one
@@ -420,6 +546,10 @@
       } else {
         // Typing done — show timestamp
         timeEl.style.opacity = "0.55";
+        if (chipWrap) {
+          const stack = wrap.firstChild;
+          stack.appendChild(chipWrap);
+        }
         const timer = setInterval(() => { timeEl.textContent = _timeAgo(now); }, 60000);
         setTimeout(() => clearInterval(timer), 3600000);
       }
@@ -484,7 +614,7 @@
       // Highlight current active session
       if (session.id === conversationId || 
           (!conversationId && session.id === sorted[0].id)) {
-        item.style.borderLeft = `3px solid ${primaryColor}`;
+        item.style.borderLeft = `3px solid ${currentPrimaryColor}`;
         item.style.paddingLeft = "11px";
       }
       item.innerHTML = `
@@ -501,7 +631,7 @@
     _localSessionId = session.id;
     conversationId  = session.conversationId || null;
     _sessionMessages = session.messages.slice();
-    session.messages.forEach(m => addMessage(m.role, m.text, m.timestamp));
+    session.messages.forEach(m => addMessage(m.role, m.text, m.timestamp, m.suggestions || []));
     showChatView();
     // Enable end chat
     document.getElementById("cw-menu-end").classList.remove("disabled");
@@ -539,7 +669,7 @@
     sendEl.disabled = true;
     document.getElementById("cw-menu-end").classList.add("disabled");
     if (focus) {
-      typeMessage("bot", _welcomeMsg);
+      typeMessage("bot", _welcomeMsg, _starterSuggestions);
       setTimeout(() => inputEl.focus(), 100);
     }
     showChatView();
@@ -548,7 +678,7 @@
   async function fetchSettings() {
     _lastDay = "";
     _sessionMessages = [];
-    typeMessage("bot", _welcomeMsg);
+    typeMessage("bot", _welcomeMsg, _starterSuggestions);
     document.getElementById("cw-menu-end").classList.remove("disabled");
     setTimeout(() => inputEl.focus(), 100);
   }
@@ -564,23 +694,29 @@
     showTyping();
 
     try {
+      const lastBotMessage = getLastBotMessage();
       const res = await fetch(`${apiBase}/widget/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agent_id: agentId, question: text, conversation_id: conversationId }),
+        body: JSON.stringify({
+          agent_id: agentId,
+          question: text,
+          conversation_id: conversationId,
+          last_bot_message: lastBotMessage,
+        }),
       });
       removeTyping();
       if (res.ok) {
         const data = await res.json();
         conversationId = data.conversation_id;
-        typeMessage("bot", data.answer || "I don't have enough information to answer that.");
+        typeMessage("bot", data.answer || "I don't have enough information to answer that.", data.suggestions || _starterSuggestions);
         document.getElementById("cw-menu-end").classList.remove("disabled");
       } else {
-        typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.");
+        typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.", _starterSuggestions);
       }
     } catch {
       removeTyping();
-      typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.");
+      typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.", _starterSuggestions);
     } finally {
       isLoading = false;
       sendEl.disabled = false;
@@ -705,7 +841,7 @@
         _sessionMessages = last.messages.slice();
         _localSessionId  = last.id; // restore stable local key
         conversationId   = last.conversationId || null; // restore server ID if saved
-        last.messages.forEach(m => addMessage(m.role, m.text, m.timestamp));
+        last.messages.forEach(m => addMessage(m.role, m.text, m.timestamp, m.suggestions || []));
         showChatView();
         setTimeout(() => {
           messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -786,28 +922,12 @@
       if (res.ok) {
         const s = await res.json();
         _welcomeMsg = s.welcome_message || "Hi! What can I help you with?";
+        _starterSuggestions = normalizeSuggestions(s.suggestions || _starterSuggestions);
         const titleEl = document.getElementById("cw-title");
         if (titleEl && s.display_name) titleEl.textContent = s.display_name;
-        // Apply dynamic color from settings
-       if (s.primary_color) {
-          const dynColor = s.primary_color;
-          const bubbleEl = document.getElementById("cw-bubble");
-          const headerEl = document.getElementById("cw-header");
-          const sendEl2  = document.getElementById("cw-send");
-          const histNewEl = document.getElementById("cw-history-new");
-          if (bubbleEl) bubbleEl.style.background = dynColor;
-          if (headerEl) headerEl.style.background = dynColor;
-          if (sendEl2)  sendEl2.style.background  = dynColor;
-          if (histNewEl) histNewEl.style.background = dynColor;
-          // Update input focus and user message color
-          const styleEl = document.createElement('style');
-          styleEl.textContent = `
-            #cw-input:focus { border-color: ${dynColor} !important; }
-            .cw-msg.user .cw-bubble-text { background: ${dynColor} !important; }
-            .cw-confirm-ok { background: ${dynColor} !important; }
-          `;
-          document.head.appendChild(styleEl);
-        }
+        if (s.primary_color) currentPrimaryColor = s.primary_color;
+        if (s.appearance === "dark" || s.appearance === "light") currentAppearance = s.appearance;
+        renderTheme();
         showPreview(_welcomeMsg);
       } else { showPreview(_welcomeMsg); }
     } catch { showPreview(_welcomeMsg); }

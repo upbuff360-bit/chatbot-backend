@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from uuid import uuid4
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -24,6 +25,7 @@ class ChunkStore:
         await self._chunks.create_index("agent_id")
         await self._chunks.create_index("document_id")
         await self._chunks.create_index("tenant_id")
+        await self._chunks.create_index([("agent_id", 1), ("chunk_type", 1), ("category", 1)])
 
     async def save_chunks(
         self,
@@ -73,22 +75,25 @@ class ChunkStore:
         await self._chunks.insert_many(docs)
         return ids
 
-    async def get_summary_chunk_ids_by_agent(self, agent_id: str) -> list[str]:
+    async def get_summary_chunk_ids_by_agent(
+        self,
+        agent_id: str,
+        *,
+        category: str | None = None,
+    ) -> list[str]:
         """
-        Return IDs of ALL summary chunks for this agent across every source type.
+        Return IDs of summary chunks for this agent across every source type.
 
-        Previously this filtered by URL pattern (/products/, /solutions/, etc.)
-        which silently excluded:
-          - Website pages whose product content lives at non-standard URLs
-          - Any summary chunk whose source_name doesn't match the hardcoded regex
-
-        The URL filter is removed. Summary chunks are compact ~250-char
-        representations created only for product/service category pages during
-        ingestion, so every chunk with chunk_type="summary" is already a
-        meaningful product/service entry — no URL filter needed.
+        category:
+          - None      -> return both product and service summary chunks
+          - "product" -> return only product summary chunks
+          - "service" -> return only service summary chunks
         """
+        query: dict = {"agent_id": agent_id, "chunk_type": "summary"}
+        if category:
+            query["category"] = category
         cursor = self._chunks.find(
-            {"agent_id": agent_id, "chunk_type": "summary"},
+            query,
             {"_id": 1},
         )
         docs = await cursor.to_list(length=None)
@@ -109,6 +114,108 @@ class ChunkStore:
             {"_id": 1, "content": 1, "source_name": 1, "source_type": 1},
         )
         return await cursor.to_list(length=None)
+
+    async def get_detail_chunks_by_agent_and_category(
+        self,
+        agent_id: str,
+        *,
+        category: str,
+        limit: int = 40,
+        source_types: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
+    ) -> list[dict]:
+        """
+        Return detail chunks for a specific category.
+
+        This is used as a stable fallback for list-style product/service queries
+        so the answer can still be complete even when vector search happens to
+        miss the most catalog-like chunk for a particular phrasing.
+        """
+        query: dict = {
+            "agent_id": agent_id,
+            "chunk_type": "detail",
+            "category": category,
+        }
+        if source_types:
+            query["source_type"] = {"$in": source_types}
+        if exclude_source_types:
+            query["source_type"] = {
+                **(query.get("source_type") or {}),
+                "$nin": exclude_source_types,
+            }
+
+        cursor = self._chunks.find(
+            query,
+            {
+                "_id": 1,
+                "content": 1,
+                "source_name": 1,
+                "category": 1,
+                "chunk_index": 1,
+                "source_type": 1,
+            },
+        ).sort([("source_type", 1), ("source_name", 1), ("chunk_index", 1)]).limit(limit)
+        return await cursor.to_list(length=limit)
+
+    async def get_contact_chunks_by_agent(
+        self,
+        agent_id: str,
+        *,
+        limit: int = 3,
+    ) -> list[dict]:
+        """
+        Return chunks that contain explicit contact details for this agent.
+
+        Used to stabilize pricing/recommendation handoff answers so email and
+        phone details appear consistently when they truly exist in knowledge.
+        """
+        email_pattern = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+        phone_pattern = re.compile(r"(?:\+\d[\d\s().-]{7,}\d|\b\d{10,}\b)")
+        placeholder_pattern = re.compile(
+            r"(?i)\b(?:email|mail|e-mail|phone|mobile|contact)\s*:\s*(?:\[\s*not available\s*\]|not available|n/?a|na|unknown|-)\b"
+        )
+        projection = {
+            "_id": 1,
+            "content": 1,
+            "source_name": 1,
+            "source_type": 1,
+            "chunk_type": 1,
+            "chunk_index": 1,
+        }
+        sort_order = [("chunk_type", 1), ("source_type", 1), ("source_name", 1), ("chunk_index", 1)]
+
+        email_docs = await self._chunks.find(
+            {
+                "agent_id": agent_id,
+                "content": {"$regex": email_pattern.pattern, "$options": "i"},
+            },
+            projection,
+        ).sort(sort_order).limit(max(limit, 4)).to_list(length=max(limit, 4))
+
+        phone_docs = await self._chunks.find(
+            {
+                "agent_id": agent_id,
+                "content": {"$regex": phone_pattern.pattern},
+            },
+            projection,
+        ).sort(sort_order).limit(max(limit, 4)).to_list(length=max(limit, 4))
+
+        combined: list[dict] = []
+        seen_ids: set[str] = set()
+        for bucket in (email_docs, phone_docs):
+            for doc in bucket:
+                doc_id = str(doc.get("_id"))
+                content = str(doc.get("content") or "").strip()
+                if not content or doc_id in seen_ids:
+                    continue
+                if placeholder_pattern.search(content):
+                    continue
+                seen_ids.add(doc_id)
+                combined.append(doc)
+                if len(combined) >= limit:
+                    return combined
+
+        return combined
 
     async def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[dict]:
         """Fetch chunks by IDs preserving Qdrant relevance order."""

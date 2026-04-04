@@ -20,7 +20,10 @@ from app.website_service import WebsiteService
 if TYPE_CHECKING:
     from app.services.chunk_store import ChunkStore
 
-FALLBACK_ANSWER = "I don't have enough information to answer that."
+FALLBACK_ANSWER = (
+    "Thank you for your question. At the moment, I do not have the relevant information available in my current context. "
+    "If you would like, please let me know if there is anything else I can help you with."
+)
 
 # Phrases that indicate a fallback response — used for reliable fallback detection
 # (Enhancement 8: broader than the previous hardcoded startswith check in chat.py)
@@ -28,7 +31,11 @@ FALLBACK_PHRASES = frozenset([
     "i don't have enough information",
     "i don't have details on that",
     "i don't have information",
+    "i don't have that detail",
+    "i don't have that information",
     "i'm not sure about that",
+    "i'd love to help, but i don't have",
+    "thank you for your question. at the moment, i do not have",
     "i don't know",
     "that's outside my knowledge",
     "i cannot find",
@@ -117,33 +124,43 @@ class RAGPipeline:
         self.vector_store.initialize_collection(recreate=False)
 
         # ── Tier 1: Summary chunk (product and service pages only) ────────────
-        if category in ("product", "service") and (page_title or page_url):
-            from app.chunking import generate_summary_chunk
-            summary_text = generate_summary_chunk(
-                title=page_title,
-                url=page_url,
-                text=text,
-            )
-            if summary_text.strip():
+        if category in ("product", "service"):
+            from app.chunking import generate_catalog_summary_chunks, generate_summary_chunk
+            summary_texts: list[str] = []
+            if page_title or page_url:
+                summary_text = generate_summary_chunk(
+                    title=page_title,
+                    url=page_url,
+                    text=text,
+                    category=category,
+                )
+                if summary_text.strip():
+                    summary_texts.append(summary_text)
+            else:
+                summary_texts = generate_catalog_summary_chunks(
+                    text=text,
+                    category=category,
+                )
+            if summary_texts:
                 summary_ids = await chunk_store.save_chunks(
                     tenant_id=tenant_id,
                     agent_id=agent_id,
                     document_id=document_id,
                     source_type=source_type,
                     source_name=source_name,
-                    chunks=[summary_text],
+                    chunks=summary_texts,
                     category=category,
                     chunk_type="summary",
                 )
-                summary_embeddings = self.embedding_service.embed_texts([summary_text])
+                summary_embeddings = self.embedding_service.embed_texts(summary_texts)
                 self.vector_store.upsert_chunks(
-                    chunks=[summary_text],
+                    chunks=summary_texts,
                     embeddings=summary_embeddings,
-                    source_files=[source_name],
+                    source_files=[source_name] * len(summary_texts),
                     chunk_ids=summary_ids,
-                    chunk_types=["summary"],
+                    chunk_types=["summary"] * len(summary_texts),
                 )
-                total_indexed += 1
+                total_indexed += len(summary_texts)
 
         # ── Tier 2: Detail chunks (all pages) ─────────────────────────────────
         chunks = chunk_text(
@@ -333,6 +350,7 @@ class RAGPipeline:
         temperature: float = 0.2,
         conversation_history: list[dict[str, str]] | None = None,
         prefetched_context: list[dict] | None = None,
+        lead_capture_enabled: bool = False,
     ) -> str:
         """
         Return a complete answer string (non-streaming).
@@ -352,6 +370,7 @@ class RAGPipeline:
             system_prompt=system_prompt,
             conversation_history=conversation_history,
             source_urls=source_urls,
+            lead_capture_enabled=lead_capture_enabled,
         )
         response = self.llm_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -372,6 +391,7 @@ class RAGPipeline:
         temperature: float = 0.2,
         conversation_history: list[dict[str, str]] | None = None,
         prefetched_context: list[dict] | None = None,
+        lead_capture_enabled: bool = False,
     ) -> Generator[str, None, None]:
         """
         Yield answer tokens as they arrive from OpenAI (Server-Sent Events).
@@ -400,6 +420,7 @@ class RAGPipeline:
             system_prompt=system_prompt,
             conversation_history=conversation_history,
             source_urls=source_urls,
+            lead_capture_enabled=lead_capture_enabled,
         )
 
         stream = self.llm_client.chat.completions.create(

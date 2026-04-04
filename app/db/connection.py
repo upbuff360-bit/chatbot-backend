@@ -57,6 +57,14 @@ async def create_indexes() -> None:
     await db.conversations.create_index("tenant_id")
     await db.conversations.create_index([("agent_id", 1), ("tenant_id", 1)])
 
+    # leads — tenant + agent + conversation scoping
+    await db.leads.create_index("agent_id")
+    await db.leads.create_index("tenant_id")
+    await db.leads.create_index([("tenant_id", 1), ("agent_id", 1), ("created_at", -1)])
+    await db.leads.create_index([("tenant_id", 1), ("agent_id", 1), ("conversation_id", 1)], unique=True)
+    await db.leads.create_index([("tenant_id", 1), ("agent_id", 1), ("email_normalized", 1)], sparse=True)
+    await db.leads.create_index([("tenant_id", 1), ("agent_id", 1), ("phone_normalized", 1)], sparse=True)
+
     # crawl_jobs
     await db.crawl_jobs.create_index("agent_id")
     await db.crawl_jobs.create_index("tenant_id")

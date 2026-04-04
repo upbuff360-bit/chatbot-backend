@@ -948,7 +948,7 @@ class WebsiteService:
         # Strip leading "www." so that links on mosil.com are accepted when
         # the crawl started at www.mosil.com (and vice-versa).
         raw_origin = urlparse(start_url).netloc
-        origin = raw_origin.removeprefix("www.")
+        origin = self._canonical_netloc(raw_origin)
 
         queue: list[str] = [start_url]
         seen: set[str] = set()
@@ -1048,14 +1048,15 @@ class WebsiteService:
                         # so networkidle never fires and wastes the full timeout
                         # on every single page.
                         # Fall back to domcontentloaded if load also times out.
+                        response = None
                         try:
-                            await pw_page.goto(
+                            response = await pw_page.goto(
                                 current_url,
                                 timeout=nav_timeout_ms,
                                 wait_until="load",
                             )
                         except PwTimeoutError:
-                            await pw_page.goto(
+                            response = await pw_page.goto(
                                 current_url,
                                 timeout=nav_timeout_ms,
                                 wait_until="domcontentloaded",
@@ -1065,6 +1066,20 @@ class WebsiteService:
                             "Playwright navigation failed for %s: %s",
                             current_url,
                             exc,
+                        )
+                        await pw_page.close()
+                        continue
+
+                    try:
+                        final_url = self._normalize_url(pw_page.url or current_url)
+                    except Exception:
+                        final_url = current_url
+
+                    if response is not None and int(response.status) >= 400:
+                        logger.debug(
+                            "Skipping %s due to HTTP status %s after render.",
+                            final_url,
+                            response.status,
                         )
                         await pw_page.close()
                         continue
@@ -1114,7 +1129,7 @@ class WebsiteService:
                     try:
                         title = await pw_page.title()
                     except Exception:
-                        title = current_url
+                        title = final_url
 
                     await pw_page.close()
 
@@ -1126,7 +1141,15 @@ class WebsiteService:
                             "Bot-detection page detected at %s (title=%r) — "
                             "skipping. The site may require stealth-playwright "
                             "or manual cookie injection to bypass Cloudflare.",
-                            current_url,
+                            final_url,
+                            title,
+                        )
+                        continue
+
+                    if self._is_soft_404(final_url, title, text):
+                        logger.debug(
+                            "Soft-404 page detected at %s (title=%r) - skipping.",
+                            final_url,
                             title,
                         )
                         continue
@@ -1134,11 +1157,11 @@ class WebsiteService:
                     if text:
                         logger.debug(
                             "Crawled page: %s | title=%r | text_len=%d",
-                            current_url, title, len(text),
+                            final_url, title, len(text),
                         )
                         page = CrawledPage(
-                            url=current_url,
-                            title=title or current_url,
+                            url=final_url,
+                            title=title or final_url,
                             text=text,
                         )
                         pages.append(page)
@@ -1152,23 +1175,23 @@ class WebsiteService:
                             stage="crawling",
                             discovered_pages=min(discovered, self.max_pages),
                             indexed_pages=len(pages),
-                            current_url=current_url,
+                            current_url=final_url,
                             message=f"Crawled {len(pages)} pages so far.",
                         )
                     else:
                         logger.debug(
                             "Empty text for %s (title=%r) — skipping.",
-                            current_url, title,
+                            final_url, title,
                         )
 
                     # Enqueue newly discovered same-domain links.
                     # Strip www. from discovered link domains too so that
                     # www.mosil.com and mosil.com are treated as the same site.
                     for href in extracted.get("links", []):
-                        absolute = self._normalize_link(current_url, href)
+                        absolute = self._normalize_link(final_url, href)
                         if not absolute:
                             continue
-                        link_origin = urlparse(absolute).netloc.removeprefix("www.")
+                        link_origin = self._canonical_netloc(urlparse(absolute).netloc)
                         if link_origin != origin:
                             continue
                         if absolute not in seen and absolute not in queue:
@@ -1199,7 +1222,7 @@ class WebsiteService:
         for the full crawl to finish.
         """
         # Strip www. so mosil.com and www.mosil.com are treated as same site
-        origin = urlparse(start_url).netloc.removeprefix("www.")
+        origin = self._canonical_netloc(urlparse(start_url).netloc)
         queue = [start_url]
         seen: set[str] = set()
         pages: list[CrawledPage] = []
@@ -1250,7 +1273,7 @@ class WebsiteService:
                 absolute = self._normalize_link(current, link)
                 if not absolute:
                     continue
-                if urlparse(absolute).netloc.removeprefix("www.") != origin:
+                if self._canonical_netloc(urlparse(absolute).netloc) != origin:
                     continue
                 if absolute not in seen and absolute not in queue:
                     queue.append(absolute)
@@ -1423,6 +1446,40 @@ class WebsiteService:
         return False
 
     @staticmethod
+    def _is_soft_404(url: str, title: str, text: str) -> bool:
+        """
+        Detect branded or SPA-rendered not-found pages that still contain text.
+        """
+        title_lower = (title or "").lower()
+        text_lower = (text or "").lower()[:1200]
+        url_lower = (url or "").lower()
+
+        title_signals = (
+            "404",
+            "page not found",
+            "not found",
+        )
+        body_signals = (
+            "404",
+            "page not found",
+            "the page you are looking for",
+            "this page could not be found",
+            "sorry, the page you requested could not be found",
+            "we can't find the page you're looking for",
+            "the requested url was not found",
+        )
+
+        if any(signal in title_lower for signal in title_signals):
+            return True
+        if any(signal in text_lower for signal in body_signals):
+            return True
+        if any(token in url_lower for token in ("/404", "/not-found")):
+            if "not found" in text_lower or "404" in text_lower:
+                return True
+
+        return False
+
+    @staticmethod
     def _looks_like_sitemap(url: str, content_type: str, content: str) -> bool:
         lowered = url.lower()
         if "sitemap" in lowered or content_type.lower().startswith(
@@ -1452,7 +1509,7 @@ class WebsiteService:
 
         normalized = parsed._replace(
             scheme=parsed.scheme.lower(),
-            netloc=parsed.netloc.lower(),
+            netloc=WebsiteService._canonical_netloc(parsed.netloc),
             path=normalized_path,
             fragment="",
         )
@@ -1469,7 +1526,19 @@ class WebsiteService:
         parsed = urlparse(absolute)
         if parsed.scheme not in {"http", "https"}:
             return None
-        return parsed._replace(fragment="").geturl()
+        return WebsiteService._normalize_url(parsed._replace(fragment="").geturl())
+
+    @staticmethod
+    def _canonical_netloc(netloc: str) -> str:
+        """
+        Canonicalize hosts for storage and same-site checks.
+
+        The crawler already treats apex and www as the same site while
+        traversing links, so we canonicalize them here as well to prevent
+        duplicate pages like example.com/ and www.example.com/.
+        """
+        normalized = (netloc or "").strip().lower()
+        return normalized.removeprefix("www.")
 
     @staticmethod
     def _clean_text(text: str) -> str:

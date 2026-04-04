@@ -79,8 +79,13 @@ class PDFService:
             xml_bytes = archive.read("word/document.xml")
         root = ET.fromstring(xml_bytes)
         namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-        chunks = [node.text or "" for node in root.findall(".//w:t", namespace)]
-        return self._clean_text(" ".join(chunks))
+        paragraphs: list[str] = []
+        for para in root.findall(".//w:p", namespace):
+            parts = [node.text or "" for node in para.findall(".//w:t", namespace)]
+            text = "".join(parts).strip()
+            if text:
+                paragraphs.append(text)
+        return self._clean_text("\n\n".join(paragraphs))
 
     def _extract_pptx_text(self, pptx_path: Path) -> str:
         with ZipFile(pptx_path) as archive:

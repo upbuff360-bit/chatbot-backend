@@ -129,6 +129,14 @@ RESOURCE_REGISTRY: list[ResourceEntry] = [
             "read": "View chats",
         },
     },
+    {
+        "resource": "leads",
+        "label":    "leads",
+        "actions":  ["read"],
+        "descriptions": {
+            "read": "View leads",
+        },
+    },
 
     # ── Add new pages below this line ─────────────────────────────────────────
     # Example:

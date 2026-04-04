@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, Upl
 from pydantic import BaseModel, Field
 
 from app.core.dependencies import CurrentUser, get_current_user
+from app.category_detector import detect_document_category, detect_page_category
 from app.models.document import DocumentResponse, DocumentUpdateRequest
 from app.models.user import UserRole
 from app.rag_pipeline import RAGPipeline
@@ -159,25 +160,31 @@ async def _reindex_website_document(
         await store.delete_document(document["id"], agent_id, tenant_id)
         return None
 
-    combined_text = "\n\n".join(
-        _format_website_page_for_ingestion(page)
-        for page in pages
-        if page.text.strip()
-    ).strip()
-    if not combined_text:
+    valid_pages = [page for page in pages if page.text.strip()]
+    if not valid_pages:
         raise ValueError("Website pages must contain readable text.")
 
-    await pipeline.ingest_single_document(
-        chunk_store=cs,
-        tenant_id=tenant_id,
-        agent_id=agent_id,
-        document_id=document["id"],
-        source_type="website",
-        source_name=source_url,
-        text=combined_text,
-    )
+    for page in valid_pages:
+        page_text = page.text.strip()
+        page_category = detect_page_category(
+            url=page.url,
+            title=page.title,
+            text=page_text,
+        )
+        await pipeline.ingest_single_document(
+            chunk_store=cs,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            document_id=document["id"],
+            source_type="website",
+            source_name=page.url or source_url,
+            text=_format_website_page_for_ingestion(page),
+            category=page_category,
+            page_title=page.title,
+            page_url=page.url,
+        )
 
-    display_name = pages[0].title.strip() or source_url
+    display_name = valid_pages[0].title.strip() or source_url
     return await store.update_document(
         document["id"],
         agent_id,
@@ -283,6 +290,10 @@ async def upload_pdf(
 
         if extracted_text.strip():
             pipeline = _build_pipeline(store, agent_id)
+            file_category = detect_document_category(
+                title=Path(target.name).stem,
+                text=extracted_text,
+            )
             await pipeline.ingest_single_document(
                 chunk_store=cs,
                 tenant_id=tenant_id,
@@ -291,6 +302,7 @@ async def upload_pdf(
                 source_type=source_type,
                 source_name=target.name,
                 text=extracted_text,
+                category=file_category,
             )
         else:
             raise ValueError(f"No text could be extracted from the {source_type.upper()} file.")
@@ -352,6 +364,11 @@ async def crawl_website(
                 page.url.strip(),
                 page.text.strip(),
             ]))
+            page_category = detect_page_category(
+                url=page.url,
+                title=page.title,
+                text=page.text,
+            )
             page_doc = await store.mark_document_uploaded(
                 agent_id, tenant_id, user.id,
                 page.title or page.url, "website",
@@ -365,6 +382,9 @@ async def crawl_website(
                 source_type="website",
                 source_name=page.url,
                 text=page_text,
+                category=page_category,
+                page_title=page.title,
+                page_url=page.url,
             )
             await store.mark_document_uploaded(
                 agent_id, tenant_id, user.id,
@@ -607,6 +627,10 @@ async def update_document(
             extracted_text = file_service.extract_text(target_path)
             if not extracted_text.strip():
                 raise ValueError(f"No text could be extracted from the {source_type.upper()} file.")
+            file_category = detect_document_category(
+                title=Path(target_path.name).stem,
+                text=extracted_text,
+            )
 
             chunk_ids = await cs.get_chunk_ids_by_document(document_id)
             if chunk_ids:
@@ -621,6 +645,7 @@ async def update_document(
                 source_type=source_type,
                 source_name=target_path.name,
                 text=extracted_text,
+                category=file_category,
             )
             updated = await store.update_document(document_id, agent_id, tenant_id, file_name=target_path.name)
             return DocumentResponse(**updated)

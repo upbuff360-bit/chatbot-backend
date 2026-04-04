@@ -10,7 +10,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a question-answering assistant.\n"
     "Answer strictly using the provided context.\n"
     "If the answer is not in the context, respond:\n"
-    "\"I don't have enough information to answer that.\"\n"
+    "\"I'd love to help, but I don't have that detail in my current information just yet. If you'd like, ask me about something else and I'll do my best to help.\"\n"
     "Do not guess or fabricate information."
 )
 
@@ -25,6 +25,7 @@ class AgentSettings(BaseModel):
     primary_color: str = "#0f172a"
     secondary_color: str = "#f8fafc"
     appearance: str = "light"
+    lead_capture_enabled: bool = False
 
 
 class AgentDocument(BaseModel):
@@ -62,6 +63,7 @@ class AgentSettingsUpdateRequest(BaseModel):
     primary_color: str = "#0f172a"
     secondary_color: str = "#f8fafc"
     appearance: str = "light"
+    lead_capture_enabled: bool = False
 
 
 class AgentResponse(BaseModel):
@@ -113,3 +115,4 @@ class AgentSettingsResponse(BaseModel):
     primary_color: str
     secondary_color: str
     appearance: str
+    lead_capture_enabled: bool

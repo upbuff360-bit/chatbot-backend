@@ -45,7 +45,11 @@ async def list_agents(
     user: CurrentUser = Depends(get_current_user),
     store: AdminStoreMongo = Depends(_get_store),
 ):
-    if not (await user.has_permission("agents", "read") or await user.has_permission("chats", "read")):
+    if not (
+        await user.has_permission("agents", "read")
+        or await user.has_permission("chats", "read")
+        or await user.has_permission("leads", "read")
+    ):
         raise HTTPException(status_code=403, detail="Your role does not have permission to view agents.")
     # Super admin sees all agents across all tenants
     if user.role == UserRole.SUPER_ADMIN:
