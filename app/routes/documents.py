@@ -473,6 +473,10 @@ async def add_text_snippet(
         manual_service.save_text_snippet(doc["id"], title, content)
 
         pipeline = _build_pipeline(store, agent_id)
+        snippet_category = detect_document_category(
+            title=title,
+            text=f"{title}\n\n{content}",
+        )
         await pipeline.ingest_single_document(
             chunk_store=cs,
             tenant_id=tenant_id,
@@ -481,6 +485,7 @@ async def add_text_snippet(
             source_type="text_snippet",
             source_name=title,
             text=f"{title}\n\n{content}",
+            category=snippet_category,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}") from exc
@@ -534,6 +539,10 @@ async def add_qa(
         manual_service.save_qa(doc["id"], question, answer)
 
         pipeline = _build_pipeline(store, agent_id)
+        qa_category = detect_document_category(
+            title=question,
+            text=f"Q: {question}\nA: {answer}",
+        )
         await pipeline.ingest_single_document(
             chunk_store=cs,
             tenant_id=tenant_id,
@@ -542,6 +551,7 @@ async def add_qa(
             source_type="qa",
             source_name=question[:80],
             text=f"Q: {question}\nA: {answer}",
+            category=qa_category,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}") from exc
@@ -600,6 +610,10 @@ async def update_document(
                 source_type="text_snippet",
                 source_name=next_name,
                 text=f"{next_name}\n\n{next_content}",
+                category=detect_document_category(
+                    title=next_name,
+                    text=f"{next_name}\n\n{next_content}",
+                ),
             )
             updated = await store.update_document(
                 document_id, agent_id, tenant_id,
@@ -631,6 +645,10 @@ async def update_document(
                 source_type="qa",
                 source_name=next_name,
                 text=f"Q: {next_name}\nA: {next_answer}",
+                category=detect_document_category(
+                    title=next_name,
+                    text=f"Q: {next_name}\nA: {next_answer}",
+                ),
             )
             updated = await store.update_document(
                 document_id, agent_id, tenant_id,

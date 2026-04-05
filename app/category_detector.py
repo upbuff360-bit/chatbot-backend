@@ -27,7 +27,8 @@ _GENERAL_URL_PATTERNS = re.compile(
     r"/(about|contact|legal|terms|privacy|cookie|cookies|data-protection|"
     r"gdpr|career|careers|blog|blogs|news|press|case-stud(?:y|ies)|"
     r"documentation|docs|faq|faqs|industry|industries|request-demo|demo|"
-    r"download|downloads|company|history|management|leadership|team|"
+    r"download|downloads|company|history|leadership|team|platform|"
+    r"management-team|management-board|our-management|senior-management|"
     r"client|clients|location|locations)/",
     re.IGNORECASE,
 )
@@ -54,7 +55,9 @@ _GENERAL_TITLE_KEYWORDS = re.compile(
     r"\b(about|contact|get in touch|terms|privacy|policy|data protection|"
     r"cookie policy|careers|blog|news|press|documentation|faq|request a demo|demo|"
     r"product finder|service finder|downloads?|company history|history|leadership|"
-    r"management|our clients|clients|locations?)\b",
+    r"management team|senior management|top management|our management|"
+    r"executive management|management board|"
+    r"our clients|clients|locations?)\b",
     re.IGNORECASE,
 )
 
@@ -83,17 +86,18 @@ def detect_page_category(
     if url_path in {"/product", "/products", "/service", "/services", "/industry", "/industries"}:
         return "general"
 
-    # Non-catalog pages often mention products/services in legal or company copy,
-    # but they should never appear as product/service listings.
-    if _GENERAL_URL_PATTERNS.search(url_path) or _GENERAL_TITLE_KEYWORDS.search(title_lower):
-        return "general"
-
-    # Strong path-based signal: explicit catalog sections should win even when
-    # the product name contains words like "service", "support", etc.
+    # Strong path-based signal checked FIRST — before any title-keyword override.
+    # A page under /products/ or /services/ is always a product/service page
+    # regardless of what words appear in its title (e.g. "Field Service Management").
     if "/products/" in url_path:
         return "product"
     if "/services/" in url_path:
         return "service"
+
+    # Non-catalog pages often mention products/services in legal or company copy,
+    # but they should never appear as product/service listings.
+    if _GENERAL_URL_PATTERNS.search(url_path) or _GENERAL_TITLE_KEYWORDS.search(title_lower):
+        return "general"
 
     # --- URL-based detection (high confidence) ---
     if _PRICING_URL_PATTERNS.search(url_path):
@@ -123,8 +127,12 @@ def detect_page_category(
 
     best_category = max(scores, key=lambda k: scores[k])
 
-    # Only assign a specific category if there's a meaningful signal
-    if scores[best_category] >= 3:
+    # For uploaded files (no URL), we have no URL path signal at all so the score
+    # is driven purely by text/title keywords. Lower the threshold from 3 → 1 so
+    # a document that clearly mentions "service" or "product" even once is not
+    # silently downgraded to "general" and stripped of its summary chunks.
+    min_score = 1 if not url else 3
+    if scores[best_category] >= min_score:
         return best_category
 
     return "general"

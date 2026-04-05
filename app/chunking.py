@@ -267,10 +267,10 @@ def generate_catalog_summary_chunks(
     heading-like lines or bullet items, then attaches a short description from
     the following lines.
     """
-    if category not in {"product", "service"}:
+    if category not in {"product", "service", "pricing"}:
         return []
 
-    label = "Service" if category == "service" else "Product"
+    label = "Service" if category == "service" else "Pricing" if category == "pricing" else "Product"
     sections = _extract_catalog_sections(text, category=category, max_items=max_items)
     summaries: list[str] = []
 
@@ -290,7 +290,14 @@ def _extract_catalog_sections(text: str, *, category: str, max_items: int) -> li
     if not raw_lines:
         return []
 
-    focused_lines = _extract_lines_from_category_section(raw_lines, category=category) or raw_lines
+    focused = _extract_lines_from_category_section(raw_lines, category=category)
+    # When we successfully found a specific category section (e.g. "Services Offered"),
+    # only bullet-point lines are valid item headings. Non-bulleted lines inside that
+    # section are sub-headers (e.g. "Development & Integration"), not individual items.
+    # When falling back to all lines, allow titleish non-bullet headings too.
+    focused_lines = focused if focused else raw_lines
+    bullet_only = bool(focused)
+
     sections: list[tuple[str, list[str]]] = []
     current_heading = ""
     current_body: list[str] = []
@@ -300,7 +307,7 @@ def _extract_catalog_sections(text: str, *, category: str, max_items: int) -> li
         if not line:
             continue
 
-        if _is_catalog_heading_candidate(raw_line, line):
+        if _is_catalog_heading_candidate(raw_line, line, bullet_only=bullet_only):
             if current_heading:
                 sections.append((current_heading, current_body))
             current_heading = line
@@ -460,7 +467,7 @@ def _match_catalog_category_hint(
     category: str | None,
     catalog_categories: list[str] | None,
 ) -> str | None:
-    if category not in {"product", "service"} or not catalog_categories:
+    if category not in {"product", "service", "pricing"} or not catalog_categories:
         return None
 
     haystack_parts = [title or "", url or ""]
@@ -646,7 +653,7 @@ def _normalize_catalog_line(raw_line: str) -> str:
     return line.strip()
 
 
-def _is_catalog_heading_candidate(raw_line: str, line: str) -> bool:
+def _is_catalog_heading_candidate(raw_line: str, line: str, bullet_only: bool = False) -> bool:
     if not line:
         return False
     if line.startswith("http://") or line.startswith("https://"):
@@ -664,6 +671,12 @@ def _is_catalog_heading_candidate(raw_line: str, line: str) -> bool:
     has_sentence_end = line.endswith((".", "?", "!"))
     has_many_commas = line.count(",") >= 2
     titleish = _looks_titleish(line)
+
+    # In focused-section mode (bullet_only=True), only accept bullet-point lines.
+    # This prevents sub-headers like "Development & Integration" from being
+    # treated as individual service/product items.
+    if bullet_only:
+        return bullet_like and not has_sentence_end
 
     if bullet_like and not has_sentence_end:
         return True

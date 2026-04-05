@@ -113,7 +113,7 @@ class RAGPipeline:
 
         Two-tier chunking strategy
         --------------------------
-        For product and service pages (category == "product" | "service"):
+        For product, service and pricing pages (category == "product" | "service" | "pricing"):
 
           Tier 1 — Summary chunk (1 per page)
             A compact ~250-char string: "Product: <title>\\nURL: <url>\\n<first sentences>"
@@ -126,7 +126,7 @@ class RAGPipeline:
             questions ("tell me more about the CRM product").
             Stored with chunk_type="detail".
 
-        For general/pricing pages only detail chunks are created (no summary).
+        For general pages only detail chunks are created (no summary).
         """
         if not text.strip() or not self.embedding_service.is_configured():
             return 0
@@ -134,8 +134,8 @@ class RAGPipeline:
         total_indexed = 0
         self.vector_store.initialize_collection(recreate=False)
 
-        # ── Tier 1: Summary chunk (product and service pages only) ────────────
-        if category in ("product", "service"):
+        # ── Tier 1: Summary chunk (product, service and pricing pages only) ─────
+        if category in ("product", "service", "pricing"):
             from app.chunking import generate_catalog_summary_chunks, generate_summary_chunk
             summary_texts: list[str] = []
             if page_title or page_url:
@@ -153,6 +153,27 @@ class RAGPipeline:
                     text=text,
                     category=category,
                 )
+                # Fallback: if the document structure isn't clear enough for
+                # section extraction (e.g. a flat service description file),
+                # create one summary chunk using the filename as the title so
+                # the document still appears in listing answers.
+                if not summary_texts and source_name:
+                    from pathlib import Path as _Path
+                    fallback_title = (
+                        _Path(source_name).stem
+                        .replace("_", " ")
+                        .replace("-", " ")
+                        .strip()
+                    )
+                    if fallback_title:
+                        fallback_text = generate_summary_chunk(
+                            title=fallback_title,
+                            url="",
+                            text=text,
+                            category=category,
+                        )
+                        if fallback_text.strip():
+                            summary_texts = [fallback_text]
             if summary_texts:
                 summary_ids = await chunk_store.save_chunks(
                     tenant_id=tenant_id,
@@ -561,10 +582,21 @@ class RAGPipeline:
                     projected_chars = total_chars + 2 + len(next_part)
                 else:
                     projected_chars = total_chars + len(next_part)
-                if len(context_parts) >= self.max_context_chunks or (
-                    context_parts and projected_chars > self.max_context_chars
-                ):
-                    break
+                # Product:/Service: summary lines are compact (~50-250 chars each).
+                # Skip the chunk-count limit for them so all catalog items always
+                # reach the LLM regardless of how many product/service entries exist.
+                # Only the character budget applies to these entries.
+                is_catalog_summary = bool(
+                    re.match(r"(?im)^\s*(?:Product|Service)\s*:", content)
+                )
+                over_chunk_limit = (
+                    not is_catalog_summary
+                    and len(context_parts) >= self.max_context_chunks
+                )
+                if over_chunk_limit or (context_parts and projected_chars > self.max_context_chars):
+                    if over_chunk_limit:
+                        break
+                    continue
                 seen_chunks.add(content)
                 context_parts.append(next_part)
                 total_chars = projected_chars

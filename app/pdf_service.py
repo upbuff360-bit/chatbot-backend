@@ -83,8 +83,14 @@ class PDFService:
         for para in root.findall(".//w:p", namespace):
             parts = [node.text or "" for node in para.findall(".//w:t", namespace)]
             text = "".join(parts).strip()
-            if text:
-                paragraphs.append(text)
+            if not text:
+                continue
+            # Detect list/bullet paragraphs via <w:numPr> and prefix with "- "
+            # so downstream chunking can identify them as bullet items.
+            is_list_item = para.find(".//w:numPr", namespace) is not None
+            if is_list_item:
+                text = f"- {text}"
+            paragraphs.append(text)
         return self._clean_text("\n\n".join(paragraphs))
 
     def _extract_pptx_text(self, pptx_path: Path) -> str:

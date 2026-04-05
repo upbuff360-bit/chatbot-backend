@@ -1103,15 +1103,18 @@ _REFERENCE_TRIGGERS = [
 _LIST_EXCLUDE_LABEL_PATTERNS = re.compile(
     r"\b(about|contact|get in touch|terms|privacy|policy|data protection|"
     r"cookie|careers|blog|news|press|documentation|faq|request a demo|demo|"
-    r"downloads?|company history|history|leadership|management|our clients|clients|"
-    r"locations?|product finder|service finder)\b",
+    r"downloads?|company history|history|leadership|our clients|clients|"
+    r"locations?|product finder|service finder|"
+    r"management team|senior management|top management|our management|"
+    r"management leadership|executive management|management board)\b",
     re.IGNORECASE,
 )
 _LIST_EXCLUDE_URL_PATTERNS = re.compile(
     r"/(about|contact|legal|terms|privacy|cookie|cookies|data-protection|"
     r"career|careers|blog|blogs|news|press|documentation|docs|faq|faqs|"
     r"industry|industries|request-demo|demo|download|downloads|company|history|"
-    r"management|leadership|team|client|clients|location|locations)/",
+    r"leadership|team|platform|client|clients|location|locations|"
+    r"management-team|management-board|our-management|senior-management)/",
     re.IGNORECASE,
 )
 
@@ -1756,13 +1759,7 @@ def _extract_same_category_comparison_scope(
                 website_category_maps[chunk_category] = category_map
             main_category = category_map.get(_normalize_website_url_for_match(source_name), "")
         if not main_category:
-            # Fall back to chunk_category ("product" / "service") so that matched
-            # labels like "Automotive Greases" are not silently dropped when the
-            # summary chunk has no embedded Category: field and no website map entry.
-            if chunk_category in {"product", "service"}:
-                main_category = chunk_category
-            else:
-                continue
+            continue
         matched_entries.append({
             "label": label,
             "main_category": main_category,
@@ -2502,22 +2499,68 @@ async def _build_context(
     # Manually added text snippets and Q&A entries have no summary chunk and
     # their source_name is a plain title — not a URL — so they never appear in
     # step 1a even with the URL filter removed.  We always pin them here so
-    # user-curated knowledge (e.g. "Asset Management System") is NEVER silently
-    # dropped from listing answers regardless of vector scores.
-    # NOTE: Files (PDFs, DOCX, etc.) and general website pages are covered by
-    # the vector search in step 2 which uses a 3× retrieval limit + lower
-    # threshold for list questions, ensuring broad knowledge base coverage.
-    if agent_id and is_list_query and list_category is None:
+    # user-curated knowledge is NEVER silently dropped from listing answers.
+    # Runs for all list queries regardless of list_category — including "offering".
+    if agent_id and is_list_query:
         manual_chunks = await cs.get_text_snippet_and_qa_chunks_by_agent(agent_id)
         seen_manual: set[str] = {c["content"] for c in summary_context}
         for c in manual_chunks:
             chunk_content = c.get("content", "").strip()
+            chunk_cat = c.get("category") or ""
+            # For scoped queries (product/service/offering) only include matching chunks
+            if list_category in {"product", "service"} and chunk_cat and chunk_cat != list_category:
+                continue
             if chunk_content and chunk_content not in seen_manual:
                 seen_manual.add(chunk_content)
                 summary_context.append({
                     "content": chunk_content,
                     "source_name": c.get("source_name", "unknown"),
                 })
+
+    # ── Step 1b2: per-category supplement for offering questions ─────────────
+    # For "what do you offer" queries, each scoped category (product, service)
+    # must be represented with enough context for the LLM to list items.
+    # Two cases are handled:
+    #   A) Category has NO summary chunks at all → fetch detail chunks
+    #   B) Category has only 1 summary chunk (generic fallback from filename) →
+    #      also fetch detail chunks so the LLM has actual item names to list
+    if agent_id and is_list_query and list_category == "offering" and scoped_categories:
+        category_summary_counts: dict[str, int] = {}
+        for c in raw_summary_context:
+            cat = c.get("category") or ""
+            if cat:
+                category_summary_counts[cat] = category_summary_counts.get(cat, 0) + 1
+
+        seen_supplement: set[str] = {c["content"] for c in summary_context}
+        for category_name in scoped_categories:
+            count = category_summary_counts.get(category_name, 0)
+            # Supplement if missing entirely OR only has 1 sparse fallback chunk
+            if count < 2:
+                # Non-website chunks first (files, text_snippets, QA)
+                supplement_chunks = await cs.get_detail_chunks_by_agent_and_category(
+                    agent_id,
+                    category=category_name,
+                    limit=16,
+                    exclude_source_types=["website"],
+                )
+                # Fall back to website detail chunks if nothing else found
+                if not supplement_chunks:
+                    supplement_chunks = await cs.get_detail_chunks_by_agent_and_category(
+                        agent_id,
+                        category=category_name,
+                        limit=16,
+                        source_types=["website"],
+                    )
+                for c in supplement_chunks:
+                    content = str(c.get("content") or "").strip()
+                    source_name = str(c.get("source_name") or "unknown")
+                    if not content or content in seen_supplement:
+                        continue
+                    seen_supplement.add(content)
+                    summary_context.append({
+                        "content": content,
+                        "source_name": source_name,
+                    })
 
     # Step 1c: pin category-matching non-website detail chunks only when the
     # summary catalog is sparse. If we already have the list of item labels,

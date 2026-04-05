@@ -102,7 +102,9 @@ class ChunkStore:
     async def get_offering_scope_by_agent(self, agent_id: str) -> str | None:
         """
         Return whether this agent's stored knowledge contains product chunks,
-        service chunks, or both.
+        service chunks, or both — across ALL source types (website, pdf, file,
+        text_snippet, qa). Checks categorized chunks first; falls back to
+        source-type-based detection for legacy uncategorized uploads.
         """
         product_exists = await self._chunks.find_one(
             {"agent_id": agent_id, "category": "product"},
@@ -112,6 +114,20 @@ class ChunkStore:
             {"agent_id": agent_id, "category": "service"},
             {"_id": 1},
         )
+
+        # Fallback: if no categorized service chunks found, check if any
+        # non-website chunks exist (files, text snippets, QA) — these may
+        # have been ingested before category detection was applied.
+        if not service_exists:
+            service_exists = await self._chunks.find_one(
+                {
+                    "agent_id": agent_id,
+                    "source_type": {"$in": ["pdf", "docx", "pptx", "txt", "text_snippet", "qa"]},
+                    "category": {"$in": [None, "general"]},
+                },
+                {"_id": 1},
+            )
+
         if product_exists and service_exists:
             return "offering"
         if product_exists:

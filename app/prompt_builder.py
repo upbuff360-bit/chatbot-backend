@@ -1298,7 +1298,7 @@ def build_messages(
                 "- Attribute: value\n\n"
                 "For same category items: include technical/spec attributes.\n"
                 "For different category items: include purpose, usage, behavior, and when to use each.\n\n"
- 
+
                 "### 5. Follow-up Question\n"
                 "End with a clarifying or decision-driving question.\n"
                 "Example: 'Would you like to explore a specific option in more detail, or shall I help you find the best fit for your needs?'\n\n"
@@ -1312,6 +1312,7 @@ def build_messages(
 
                 "IMPORTANT CONSTRAINTS:\n"
                 "- Do NOT compare unrelated technical specs across different categories.\n"
+                "- NEVER use markdown tables or HTML tables anywhere in the comparison response.\n"
                 "- Do NOT produce empty or vague comparisons.\n"
                 "- Do NOT skip the Recommendation section.\n"
                 "- Always prioritize clarity over completeness.\n"
@@ -1422,12 +1423,30 @@ def build_messages(
             "End with one short invitation asking which category they would like to explore."
         )
     if list_category == "offering":
-        list_scope_hint = (
-            "\n\nIMPORTANT: This is a general offerings question. "
-            "If the context contains both Product: and Service: items, list BOTH sections together. "
-            "Do not narrow the answer to only services or only products because of conversation history. "
-            "If only one of those categories exists in context, list only that category."
-        )
+        # Use offering_scope (actual knowledge base content) to decide what to show.
+        # Fall back to context-based detection if offering_scope is not available.
+        resolved_scope = offering_scope or detect_context_offering_scope(context)
+        if resolved_scope == "product":
+            list_scope_hint = (
+                "\n\nIMPORTANT: This is a general offerings question, but the available knowledge "
+                "contains only Product information. List ONLY the Product: items from the context. "
+                "Do NOT mention or imply that services exist."
+            )
+        elif resolved_scope == "service":
+            list_scope_hint = (
+                "\n\nIMPORTANT: This is a general offerings question, but the available knowledge "
+                "contains only Service information. List ONLY the Service: items from the context. "
+                "Do NOT mention or imply that products exist."
+            )
+        else:
+            list_scope_hint = (
+                "\n\nIMPORTANT: This is a general offerings question. "
+                "The knowledge base contains both products and services. "
+                "List BOTH Product: and Service: items together in clearly labelled sections. "
+                "Do not narrow the answer to only services or only products. "
+                "If only one category appears in the context despite both being available, "
+                "list what is present and note the other category exists."
+            )
     elif list_category == "product":
         list_scope_hint = (
             "\n\nIMPORTANT: This question is specifically about products. "
