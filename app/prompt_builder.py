@@ -138,7 +138,9 @@ SYSTEM_PROMPT = (
     "Only add a closing when it genuinely fits.\n"
     "\n"
     "RULE 5 — COMPARISONS:\n"
-    "For lists and comparisons, present items line by line. Use numbered lists when enumerating multiple options. No tables.\n"
+    "For general lists, present items line by line using numbered lists. No tables for plain lists.\n"
+    "For comparison questions (when the user asks to compare two or more items), follow the COMPARISON ENGINE instructions injected in the user prompt exactly. "
+    "Tables ARE allowed and expected inside structured comparison responses.\n"
     "\n"
     "RULE 5b — UNCLEAR RESPONSES:\n"
     "If the user's reply is vague, ambiguous, or doesn't clearly relate to the previous topic "
@@ -242,11 +244,56 @@ def is_comparison_question(question: str) -> bool:
     return any(trigger in lower for trigger in COMPARISON_TRIGGERS)
 
 
+def extract_comparison_items(question: str) -> list[str]:
+    """
+    Extract individual items being compared from a comparison question.
+
+    Examples:
+      "compare Automotive Greases and Extreme Pressure Greases"
+        → ["Automotive Greases", "Extreme Pressure Greases"]
+      "Grease A vs Grease B"
+        → ["Grease A", "Grease B"]
+    Returns an empty list if no clear items can be extracted.
+    """
+    # Strip leading comparison trigger words to isolate the subject phrase
+    cleaned = re.sub(
+        r"(?i)^(compare|comparison of|difference between|differences between|contrast)\s+",
+        "",
+        question.strip(),
+    ).strip()
+
+    # Try each split pattern in priority order
+    for pattern in (
+        r"\s+vs\.?\s+",
+        r"\s+versus\s+",
+        r"\s+and\s+",
+        r"\s+or\s+",
+        r"\s+between\s+",
+    ):
+        parts = re.split(pattern, cleaned, flags=re.I)
+        if len(parts) >= 2:
+            items = [p.strip().strip("?.,!:") for p in parts if p.strip()]
+            # Only return if every item looks like a real noun phrase (> 2 chars)
+            if all(len(item) > 2 for item in items):
+                return items
+
+    return []
+
+
 def is_pricing_question(question: str) -> bool:
     lower = question.lower()
     return bool(re.search(
         r"\b(price|pricing|cost|costs|quote|quotes|fee|fees|charge|charges|"
         r"how much|subscription|plan|plans|rate|rates)\b",
+        lower,
+    ))
+
+
+def is_career_question(question: str) -> bool:
+    lower = (question or "").lower()
+    return bool(re.search(
+        r"\b(job|jobs|career|careers|opening|openings|open position|open positions|"
+        r"vacancy|vacancies|hiring|apply|application|recruitment|cv|resume)\b",
         lower,
     ))
 
@@ -979,6 +1026,29 @@ def build_required_lead_capture_followup(
     return f"{opening}{request} {reassurance}".strip()
 
 
+def build_required_career_followup(
+    question: str,
+    answer: str,
+    context: str,
+) -> str:
+    if not is_career_question(question):
+        return ""
+
+    application_email = _extract_job_application_email(context)
+    if not application_email:
+        return ""
+
+    answer_lower = (answer or "").lower()
+    if application_email.lower() in answer_lower:
+        return ""
+    if "updated cv" in answer_lower or "send your cv" in answer_lower or "send your updated cv" in answer_lower:
+        return ""
+    if "resume" in answer_lower and application_email.lower() in answer_lower:
+        return ""
+
+    return f"If you're interested in applying, please send your updated CV to {application_email}."
+
+
 # ── Enhancement 5: LLM-assisted query rewriting ────────────────────────────────
 
 def rewrite_query_with_llm(question: str, llm_client) -> list[str]:
@@ -1089,6 +1159,38 @@ def _extract_grounded_contact_details(context: str) -> dict[str, str | None]:
     }
 
 
+def _extract_job_application_email(context: str) -> str | None:
+    if not context:
+        return None
+
+    cue_re = re.compile(
+        r"(?i)\b(job|jobs|career|careers|opening|openings|position|positions|"
+        r"vacancy|vacancies|hiring|apply|application|cv|resume|recruitment|hr)\b"
+    )
+
+    for raw_line in str(context).splitlines():
+        line = raw_line.strip()
+        if not line or _CONTACT_PLACEHOLDER_RE.search(line):
+            continue
+        if not cue_re.search(line):
+            continue
+        match = _CONTACT_EMAIL_RE.search(line)
+        if match:
+            return match.group(0)
+
+    for paragraph in re.split(r"\n\s*\n", str(context)):
+        text = paragraph.strip()
+        if not text or _CONTACT_PLACEHOLDER_RE.search(text):
+            continue
+        if not cue_re.search(text):
+            continue
+        match = _CONTACT_EMAIL_RE.search(text)
+        if match:
+            return match.group(0)
+
+    return None
+
+
 def build_messages(
     context: str,
     question: str,
@@ -1141,20 +1243,83 @@ def build_messages(
 
     comparison_hint = ""
     if is_comparison_question(question):
-        comparison_hint = (
-            "\n\nIMPORTANT: This is a comparison question. "
-            "Start with a warm friendly sentence like \"Sure! Here's a comparison of...\" or "
-            "\"Great question! Let me break that down for you.\" "
-            "Compare products only against other products in the same category, and compare services only against other services in the same category. "
-            "Do not compare a product with a service, and do not mix items from different categories into the same comparison. "
-            "If the available context shows that the named items are different item types or belong to different categories, say that politely and explain that completely different items cannot be compared fairly because each category serves a different purpose. "
-            "Then ask the user to compare within the same category instead. "
-            "Then list each item in plain text like:\n"
-            "Basic Plan: $10/mo\nFeatures: Chat, Email\n\n"
-            "Pro Plan: $25/mo\nFeatures: Chat, Email, API\n\n"
-            "End with a varied human closing. "
-            "Do NOT use tables or markdown. No robotic tone."
-        )
+        comparison_items = extract_comparison_items(question)
+        if len(comparison_items) < 2:
+            # Vague comparison — user said "compare products/services" without naming
+            # specific items. Ask for clarification instead of hallucinating.
+            comparison_hint = (
+                "\n\nIMPORTANT: The user has asked to compare, but has NOT specified which "
+                "products or services to compare. "
+                "Do NOT attempt a comparison. Do NOT guess, invent, or hallucinate any items. "
+                "Do NOT list products and compare them on your own. "
+                "Instead, respond with ONE short, polite clarification question asking the user "
+                "to name the specific products or services they want compared. "
+                "Example: 'Which products would you like me to compare? "
+                "Please let me know the specific ones you have in mind.' "
+                "Keep the response brief and professional — do not add anything else."
+            )
+        else:
+            comparison_hint = (
+                "\n\n=== COMPARISON ENGINE — MANDATORY INSTRUCTIONS ===\n"
+                "You are acting as a comparison engine. The user has asked to compare two or more items.\n\n"
+
+                "CORE RULES:\n"
+                "1. ALWAYS respond to a comparison request. NEVER reject or refuse a comparison.\n"
+                "2. EVEN IF the items belong to different categories, still compare them.\n"
+                "3. First classify each item:\n"
+                "   - Type: Product OR Service\n"
+                "   - Category: Identify the category for each item based on the context.\n"
+                "4. Comparison logic:\n"
+                "   - IF same category → SPEC-BASED comparison: focus on technical attributes and specifications.\n"
+                "   - IF different categories → PURPOSE-BASED comparison: focus on use case, function, and when to use each. "
+                "DO NOT force technical parameter comparisons across different categories.\n\n"
+
+                "OUTPUT STRUCTURE — generate the response in this exact order:\n\n"
+
+                "### 1. Recommendation (Decision First)\n"
+                "Provide a clear, concise recommendation.\n"
+                "Format: 'X is better for <use case>, while Y is better for <use case>.'\n\n"
+
+                "### 2. High-Level Summary (ONLY if different categories)\n"
+                "Briefly explain the fundamental difference in purpose. Keep it short and clear.\n\n"
+
+                "### 3. Key Differences\n"
+                "Use bullet points. Focus on the most important distinctions. Max 4–6 points.\n\n"
+
+                "### 4. Detailed Comparison\n"
+                "Present each item as its own labeled block with bullet points. NEVER use a table or markdown table.\n"
+                "Format each block exactly like this:\n"
+                "[Product/Service Name]\n"
+                "- Attribute: value\n"
+                "- Attribute: value\n"
+                "- Attribute: value\n\n"
+                "[Next Product/Service Name]\n"
+                "- Attribute: value\n"
+                "- Attribute: value\n\n"
+                "For same category items: include technical/spec attributes.\n"
+                "For different category items: include purpose, usage, behavior, and when to use each.\n\n"
+ 
+                "### 5. Follow-up Question\n"
+                "End with a clarifying or decision-driving question.\n"
+                "Example: 'Would you like to explore a specific option in more detail, or shall I help you find the best fit for your needs?'\n\n"
+
+                "STYLE GUIDELINES:\n"
+                "- Be professional, polite, and positive.\n"
+                "- Do NOT use filler words like 'certainly' as an opener.\n"
+                "- Be concise but informative.\n"
+                "- Avoid unnecessary technical jargon unless required.\n"
+                "- Focus on helping the user make a decision.\n\n"
+
+                "IMPORTANT CONSTRAINTS:\n"
+                "- Do NOT compare unrelated technical specs across different categories.\n"
+                "- Do NOT produce empty or vague comparisons.\n"
+                "- Do NOT skip the Recommendation section.\n"
+                "- Always prioritize clarity over completeness.\n"
+                "- Use ONLY information present in the CONTEXT. Do not invent or hallucinate specifications.\n"
+                "- If specific details for one item are missing from context, note that briefly and compare what is available.\n\n"
+
+                "=== END OF COMPARISON ENGINE INSTRUCTIONS ==="
+            )
 
     demo_target_clarification_hint = ""
     if should_clarify_demo_target(question, conversation_history):
@@ -1208,6 +1373,18 @@ def build_messages(
             "Since pricing can vary depending on your exact requirements, our sales team would be best positioned to provide accurate and tailored information. "
             "I'd be happy to connect you with them to discuss your needs further.'"
         )
+
+    career_hint = ""
+    if is_career_question(question):
+        job_application_email = _extract_job_application_email(context)
+        if job_application_email:
+            career_hint = (
+                "\n\nIMPORTANT: This is a careers or job-openings question. "
+                "After listing or describing the available openings, add one short application note at the end using this exact grounded email address. "
+                f"Use wording like: 'If you're interested in applying, please send your updated CV to {job_application_email}.' "
+                "If the user shows interest in any open position, include that same application email in the reply. "
+                "Do not invent a different email address."
+            )
 
     recommendation_hint = ""
     if is_recommendation_question(question):
@@ -1416,6 +1593,7 @@ def build_messages(
         f"{comparison_hint}"
         f"{demo_target_clarification_hint}"
         f"{pricing_hint}"
+        f"{career_hint}"
         f"{recommendation_hint}"
         f"{list_scope_hint}"
         f"{catalog_category_hint}"

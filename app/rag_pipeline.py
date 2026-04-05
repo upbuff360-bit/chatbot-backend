@@ -15,8 +15,10 @@ from app.manual_knowledge_service import ManualKnowledgeService
 from app.pdf_service import PDFService
 from app.prompt_builder import (
     build_messages,
+    build_required_career_followup,
     build_required_lead_capture_followup,
     expand_query,
+    extract_comparison_items,
     is_comparison_question,
     is_list_question,
 )
@@ -317,6 +319,19 @@ class RAGPipeline:
         attempted_variants = list(query_variants)
         _search_variants(query_variants, limit=retrieval_limit, score_threshold=threshold)
 
+        # For comparison questions, also search each item individually.
+        # The composite query "compare X and Y" often doesn't embed close enough
+        # to individual product chunks, so we run a dedicated search per item
+        # to guarantee context for both sides of the comparison.
+        if is_comparison_question(question):
+            comparison_items = extract_comparison_items(question)
+            if comparison_items:
+                _search_variants(
+                    comparison_items,
+                    limit=retrieval_limit,
+                    score_threshold=threshold,
+                )
+
         should_try_llm_rewrite = self.llm_client is not None and not is_list_question(question)
         if not all_matches and should_try_llm_rewrite:
             llm_variants = expand_query(
@@ -412,6 +427,13 @@ class RAGPipeline:
             temperature=min(temperature, 0.7),
         )
         answer = (response.choices[0].message.content or FALLBACK_ANSWER).strip()
+        career_followup = build_required_career_followup(
+            question,
+            answer,
+            "\n\n".join(context_parts),
+        )
+        if career_followup:
+            answer = f"{answer}\n\n{career_followup}".strip()
         followup = build_required_lead_capture_followup(
             question,
             answer,
@@ -480,6 +502,15 @@ class RAGPipeline:
                 yield delta.content
 
         full_answer = "".join(streamed_parts).strip()
+
+        career_followup = build_required_career_followup(
+            question,
+            full_answer,
+            "\n\n".join(context_parts),
+        )
+        if career_followup:
+            yield "\n\n" + career_followup
+            full_answer = f"{full_answer}\n\n{career_followup}".strip()
 
         followup = build_required_lead_capture_followup(
             question,

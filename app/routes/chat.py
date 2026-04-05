@@ -1756,7 +1756,13 @@ def _extract_same_category_comparison_scope(
                 website_category_maps[chunk_category] = category_map
             main_category = category_map.get(_normalize_website_url_for_match(source_name), "")
         if not main_category:
-            continue
+            # Fall back to chunk_category ("product" / "service") so that matched
+            # labels like "Automotive Greases" are not silently dropped when the
+            # summary chunk has no embedded Category: field and no website map entry.
+            if chunk_category in {"product", "service"}:
+                main_category = chunk_category
+            else:
+                continue
         matched_entries.append({
             "label": label,
             "main_category": main_category,
@@ -1788,33 +1794,23 @@ def _extract_same_category_comparison_scope(
         if entry.get("chunk_category")
     }
 
-    if not matched_entries or len(distinct_categories) != 1 or len(distinct_chunk_categories) != 1:
+    if not matched_entries:
         return {
             "main_category": None,
             "chunk_category": None,
             "source_names": set(),
-            "cross_category": len(distinct_categories) > 1,
+            "cross_category": False,
             "matched_entries": matched_entries,
             "focus_entry": matched_entries[0] if matched_entries else None,
         }
 
-    main_category = matched_entries[0]["main_category"]
-    chunk_category = matched_entries[0]["chunk_category"]
-    source_names: set[str] = set()
-    category_map = website_category_maps.get(chunk_category) or {}
-    if not category_map and agent_id and chunk_category in {"product", "service"}:
-        category_map = _build_agent_website_category_map(agent_id, list_category=chunk_category)
-        website_category_maps[chunk_category] = category_map
-    for chunk in summary_chunks:
-        current_chunk_category = str(chunk.get("category") or "")
-        if current_chunk_category != chunk_category:
-            continue
-        source_name = str(chunk.get("source_name") or "unknown")
-        chunk_main_category = _extract_summary_field(str(chunk.get("content") or ""), "category")
-        if not chunk_main_category and agent_id and category_map:
-            chunk_main_category = category_map.get(_normalize_website_url_for_match(source_name), "")
-        if _normalize_summary_label(chunk_main_category) == _normalize_summary_label(main_category):
-            source_names.add(source_name)
+    main_category = matched_entries[0]["main_category"] if len(distinct_categories) == 1 else None
+    chunk_category = matched_entries[0]["chunk_category"] if len(distinct_chunk_categories) == 1 else None
+    source_names: set[str] = {
+        str(entry.get("source_name") or "unknown")
+        for entry in matched_entries
+        if str(entry.get("source_name") or "").strip()
+    }
     return {
         "main_category": main_category,
         "chunk_category": chunk_category,
@@ -2392,12 +2388,7 @@ async def _build_context(
                 )
                 comparison_source_names = comparison_scope.get("source_names") or set()
                 comparison_category = str(comparison_scope.get("main_category") or "").strip()
-                if comparison_scope.get("cross_category"):
-                    summary_context = [{
-                        "content": "Comparison Scope: The explicitly referenced items belong to different categories. Ask the user which category they would like to compare within, and do not compare across categories.",
-                        "source_name": "comparison",
-                    }]
-                elif comparison_source_names:
+                if comparison_source_names:
                     summary_context = (
                         ([{
                             "content": f"Comparison Category: {comparison_category}",
