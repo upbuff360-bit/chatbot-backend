@@ -3,6 +3,12 @@ from __future__ import annotations
 import os
 import re
 
+_CONTACT_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_CONTACT_PHONE_RE = re.compile(r"(?:\+\d[\d\s().-]{7,}\d|\b\d{7,}\b)")
+_CONTACT_PLACEHOLDER_RE = re.compile(
+    r"(?i)\b(?:email|mail|e-mail|phone|mobile|contact)\s*:\s*(?:\[\s*not available\s*\]|not available|n/?a|na|unknown|-)\b"
+)
+
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 
@@ -397,13 +403,28 @@ def detect_list_category(question: str) -> str | None:
     return None
 
 
+def detect_context_offering_scope(context: str) -> str | None:
+    has_products = bool(re.search(r"(?im)^\s*Product\s*:", context or ""))
+    has_services = bool(re.search(r"(?im)^\s*Service\s*:", context or ""))
+    if has_products and has_services:
+        return "offering"
+    if has_products:
+        return "product"
+    if has_services:
+        return "service"
+    return None
+
+
 def is_qualified_inquiry_question(question: str) -> bool:
     lower = question.lower()
     return bool(re.search(
         r"\b("
         r"demo|book a demo|schedule a demo|request a demo|"
+        r"quote|quotation|pricing|price|cost|proposal|rfq|"
         r"service request|support request|implementation request|"
-        r"customization|customisation|customize|customise|inspection|assessment|audit|site visit|"
+        r"customization|customisation|customize|customise|"
+        r"integration|integrations|integrate|"
+        r"inspection|assessment|audit|site visit|"
         r"erp customization|erp customisation|erp inspection|erp assessment|erp audit"
         r")\b",
         lower,
@@ -413,6 +434,36 @@ def is_qualified_inquiry_question(question: str) -> bool:
 def is_demo_request_question(question: str) -> bool:
     lower = question.lower()
     return bool(re.search(r"\b(demo|book a demo|schedule a demo|request a demo)\b", lower))
+
+
+def is_appointment_request_question(question: str) -> bool:
+    lower = question.lower()
+    return bool(re.search(r"\b(appointment|book an appointment|schedule an appointment)\b", lower))
+
+
+def is_lead_capture_intent_question(question: str) -> bool:
+    lower = (question or "").lower().strip()
+    if not lower:
+        return False
+
+    if (
+        is_demo_request_question(lower)
+        or is_appointment_request_question(lower)
+        or is_pricing_question(lower)
+        or is_qualified_inquiry_question(lower)
+    ):
+        return True
+
+    return bool(re.search(
+        r"\b("
+        r"interested|interested in|showing interest|"
+        r"looking to buy|ready to buy|want to buy|purchase|buy|"
+        r"contact me|call me|reach me|reach out|follow up|callback|"
+        r"consultation|let'?s talk|talk to someone|get in touch|"
+        r"custom solution|tailored solution"
+        r")\b",
+        lower,
+    ))
 
 
 def has_qualified_inquiry(
@@ -537,6 +588,117 @@ def _text_has_interest_details(text: str) -> bool:
     )) and len(re.findall(r"[a-z0-9]+", lower)) >= 5
 
 
+def _extract_demo_target_candidate(text: str) -> str | None:
+    normalized = " ".join((text or "").strip().split())
+    if not normalized:
+        return None
+
+    generic_targets = {
+        "a product",
+        "the product",
+        "product",
+        "products",
+        "a service",
+        "the service",
+        "service",
+        "services",
+        "a solution",
+        "the solution",
+        "solution",
+        "solutions",
+        "your product",
+        "your products",
+        "your service",
+        "your services",
+        "your solution",
+        "your solutions",
+        "more information",
+        "pricing",
+        "a demo",
+        "the demo",
+        "demo",
+        "an appointment",
+        "the appointment",
+        "appointment",
+    }
+
+    def clean_candidate(candidate: str | None) -> str | None:
+        if not candidate:
+            return None
+        cleaned = candidate.strip(" .,:;!?-")
+        cleaned = re.sub(
+            r"^(?:(?:i am|i'm)\s+interested in|interested in|looking for|looking to|want to|want|need to|need|book|schedule|request)\s+",
+            "",
+            cleaned,
+            flags=re.I,
+        )
+        cleaned = re.sub(
+            r"^(?:(?:i\s+)?(?:need|want|would\s+like|would\s+love|am\s+looking)\s+to\s+)?"
+            r"(?:book|schedule|request)\s+",
+            "",
+            cleaned,
+            flags=re.I,
+        )
+        cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.I)
+        cleaned = cleaned.strip(" .,:;!?-")
+        if re.fullmatch(
+            r"(?:(?:i\s+)?(?:need|want|would\s+like|would\s+love|am\s+looking)\s+to\s+)?"
+            r"(?:book|schedule|request)?\s*(?:a|an|the)?",
+            cleaned,
+            re.I,
+        ):
+            return None
+        if not cleaned or cleaned.lower() in generic_targets:
+            return None
+        return cleaned
+
+    referential_match = re.search(
+        r"\b(?:this|that|the first|the second|the third|first|second|third)\s+(?:product|service|solution|offering)\b",
+        normalized,
+        re.I,
+    )
+    if referential_match:
+        return referential_match.group(0)
+
+    patterns = (
+        r"\b(?:demo|appointment|meeting|call)\b.{0,40}?\b(?:for|about|on)\s+([A-Za-z0-9][A-Za-z0-9 &+/\-]{1,60})",
+        r"\b([A-Za-z0-9][A-Za-z0-9 &+/\-]{1,60})\s+(?:demo|appointment|meeting|call)\b",
+    )
+    for pattern in patterns:
+        target_match = re.search(pattern, normalized, re.I)
+        candidate = clean_candidate(target_match.group(1) if target_match else None)
+        if candidate:
+            return candidate
+    return None
+
+
+def has_demo_target_context(
+    question: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> bool:
+    texts = [question]
+    if conversation_history:
+        texts.extend(
+            str(msg.get("content") or "")
+            for msg in conversation_history
+            if msg.get("role") == "user"
+        )
+
+    for text in texts:
+        if _extract_demo_target_candidate(text):
+            return True
+    return False
+
+
+def should_clarify_demo_target(
+    question: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> bool:
+    if not (is_demo_request_question(question) or is_appointment_request_question(question)):
+        return False
+    return not has_demo_target_context(question, conversation_history)
+
+
 def _is_information_request_question(text: str) -> bool:
     lower = (text or "").lower().strip()
     if not lower:
@@ -552,40 +714,100 @@ def _is_information_request_question(text: str) -> bool:
     ))
 
 
+def _is_affirmative_demo_followup(
+    question: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> bool:
+    normalized = re.sub(r"[!?.]+$", "", (question or "").strip().lower()).strip()
+    if normalized not in {
+        "yes",
+        "yes please",
+        "yep",
+        "yeah",
+        "yup",
+        "sure",
+        "sure please",
+        "ok",
+        "okay",
+        "go ahead",
+        "please do",
+    }:
+        return False
+
+    if not conversation_history:
+        return False
+
+    recent_assistant_demo_offer = False
+    for msg in reversed(conversation_history[-6:]):
+        if msg.get("role") != "assistant":
+            continue
+        lower = str(msg.get("content") or "").lower()
+        if (
+            "would you like to proceed with booking" in lower
+            or "would you like to proceed with scheduling" in lower
+            or "would you like to book that demo" in lower
+            or "would you like to schedule that demo" in lower
+            or ("would you like to proceed" in lower and "demo" in lower)
+        ):
+            recent_assistant_demo_offer = True
+            break
+
+    if not recent_assistant_demo_offer:
+        return False
+
+    return has_demo_target_context(question, conversation_history)
+
+
+def _assistant_requested_customer_details(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "share your name",
+            "share your email",
+            "share your phone",
+            "share your company",
+            "share your contact details",
+            "follow up on this request",
+            "handled in line with our privacy practices",
+            "handled with care",
+        )
+    )
+
+
 def should_apply_demo_lead_capture(
     question: str,
     conversation_history: list[dict[str, str]] | None = None,
 ) -> bool:
-    if is_demo_request_question(question):
+    if is_lead_capture_intent_question(question):
+        return True
+    if _is_affirmative_demo_followup(question, conversation_history):
         return True
 
     if not conversation_history:
         return False
 
-    recent_user_demo = False
+    recent_user_lead_intent = False
     recent_assistant_asked_for_details = False
     for msg in reversed(conversation_history[-6:]):
         role = str(msg.get("role") or "")
         content = str(msg.get("content") or "")
-        lower = content.lower()
-        if role == "user" and is_demo_request_question(content):
-            recent_user_demo = True
-        if role == "assistant" and (
-            "share your name" in lower
-            or "follow up on this request" in lower
-            or "handled with care" in lower
-        ):
+        if role == "user" and is_lead_capture_intent_question(content):
+            recent_user_lead_intent = True
+        if role == "assistant" and _assistant_requested_customer_details(content):
             recent_assistant_asked_for_details = True
-        if recent_user_demo and recent_assistant_asked_for_details:
+        if recent_user_lead_intent and recent_assistant_asked_for_details:
             break
 
-    if not recent_user_demo or not recent_assistant_asked_for_details:
+    if not recent_user_lead_intent or not recent_assistant_asked_for_details:
         return False
 
-    if _is_information_request_question(question):
+    if _is_information_request_question(question) and not is_lead_capture_intent_question(question):
         return False
 
     return bool(
+        is_lead_capture_intent_question(question)
+        or
         _text_has_contact_details(question)
         or _is_compact_customer_contact_submission(question)
         or _extract_customer_company(question)
@@ -660,6 +882,103 @@ def has_customer_contact_details(
     return status["name"] or status["email"] or status["phone"] or status["company"]
 
 
+def _format_detail_list(items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _answer_already_requests_customer_details(answer: str) -> bool:
+    lower = (answer or "").lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "share your name",
+            "share your email",
+            "share your phone",
+            "share your phone number",
+            "share your company",
+            "share your contact details",
+            "could you please share your",
+            "could you share your",
+            "please provide your",
+            "please share your",
+        )
+    )
+
+
+def build_required_lead_capture_followup(
+    question: str,
+    answer: str,
+    conversation_history: list[dict[str, str]] | None = None,
+    *,
+    lead_capture_enabled: bool = False,
+) -> str:
+    if not lead_capture_enabled:
+        return ""
+    if not should_apply_demo_lead_capture(question, conversation_history):
+        return ""
+    if should_clarify_demo_target(question, conversation_history):
+        return ""
+    if _answer_already_requests_customer_details(answer):
+        return ""
+
+    customer_detail_status = get_customer_detail_status(question, conversation_history)
+    customer_detail_values = get_customer_detail_values(question, conversation_history)
+
+    missing_details: list[str] = []
+    if not customer_detail_status["name"]:
+        missing_details.append("name")
+    if not customer_detail_status["email"]:
+        missing_details.append("email")
+    if not customer_detail_status["phone"]:
+        missing_details.append("phone number")
+    if not customer_detail_status["company"]:
+        missing_details.append("company name")
+    if not customer_detail_status["interest"]:
+        missing_details.append("specific requirements or use case")
+
+    if not missing_details:
+        return ""
+
+    provided_fields: list[str] = []
+    if customer_detail_status["name"]:
+        provided_fields.append("name")
+    if customer_detail_status["email"]:
+        provided_fields.append("email")
+    if customer_detail_status["phone"]:
+        provided_fields.append("phone number")
+    if customer_detail_status["company"]:
+        provided_fields.append("company name")
+
+    missing_text = _format_detail_list(missing_details)
+    provided_text = _format_detail_list(provided_fields)
+    customer_name = customer_detail_values.get("name")
+    name_prefix = f" {customer_name}" if customer_name else ""
+
+    if is_pricing_question(question):
+        if provided_text:
+            opening = f"Thank you{name_prefix}, we have your {provided_text}. "
+        else:
+            opening = "To help our team prepare an accurate quote, "
+        request = f"Could you please share your {missing_text}?"
+    else:
+        if provided_text:
+            opening = f"Thank you{name_prefix}, we have your {provided_text}. "
+        else:
+            opening = "To help our team follow up on this request, "
+        request = f"Could you please share your {missing_text}?"
+
+    reassurance = (
+        "Your details will only be used to follow up on this request and will be handled in line with our privacy practices."
+    )
+    return f"{opening}{request} {reassurance}".strip()
+
+
 # ── Enhancement 5: LLM-assisted query rewriting ────────────────────────────────
 
 def rewrite_query_with_llm(question: str, llm_client) -> list[str]:
@@ -695,13 +1014,18 @@ def rewrite_query_with_llm(question: str, llm_client) -> list[str]:
         return []
 
 
-def expand_query(question: str, llm_client=None) -> list[str]:
+def expand_query(
+    question: str,
+    llm_client=None,
+    *,
+    allow_llm_rewrite: bool = False,
+) -> list[str]:
     """
     Generate up to 4 alternative phrasings:
       1. Original question (always first)
       2. Comparison-specific variants (if detected)
       3. Synonym-expansion variant
-      4. LLM-rewritten variants (if llm_client provided and synonyms gave < 2 extras)
+      4. LLM-rewritten variants (only when allow_llm_rewrite=True)
     """
     words = question.lower().split()
     variants: list[str] = [question]
@@ -725,7 +1049,7 @@ def expand_query(question: str, llm_client=None) -> list[str]:
             break
 
     # LLM rewrite when synonyms didn't give enough diversity
-    if llm_client is not None and len(variants) < 3:
+    if allow_llm_rewrite and llm_client is not None and len(variants) < 3:
         llm_variants = rewrite_query_with_llm(question, llm_client)
         for v in llm_variants:
             if v.lower() not in [x.lower() for x in variants]:
@@ -741,6 +1065,30 @@ def _format_source_urls(source_urls: list[str] | None) -> str:
     return ""
 
 
+def _extract_grounded_contact_details(context: str) -> dict[str, str | None]:
+    if not context:
+        return {"email": None, "phone": None}
+
+    cleaned_context = "\n".join(
+        line for line in str(context).splitlines()
+        if not _CONTACT_PLACEHOLDER_RE.search(line)
+    )
+
+    email_match = _CONTACT_EMAIL_RE.search(cleaned_context)
+    phone_value: str | None = None
+    for match in _CONTACT_PHONE_RE.finditer(cleaned_context):
+        candidate = match.group(0).strip()
+        digits = re.sub(r"\D", "", candidate)
+        if len(digits) >= 7:
+            phone_value = candidate
+            break
+
+    return {
+        "email": email_match.group(0) if email_match else None,
+        "phone": phone_value,
+    }
+
+
 def build_messages(
     context: str,
     question: str,
@@ -748,6 +1096,7 @@ def build_messages(
     conversation_history: list[dict[str, str]] | None = None,
     source_urls: list[str] | None = None,
     lead_capture_enabled: bool = False,
+    offering_scope: str | None = None,
 ) -> list[dict[str, str]]:
     """
     Build the message list for the LLM.
@@ -775,16 +1124,18 @@ def build_messages(
         merged_system += (
             "\n\n---\n\n"
             "Lead capture guidance:\n"
-            "- Ask for customer contact details only in the active demo-request flow, not in ordinary product, service, pricing, or general information answers.\n"
+            "- Ask for customer contact details only in an active high-intent follow-up flow, such as demo or appointment requests, pricing or quote requests, customization, integration, service or support requests, or explicit buying interest.\n"
             "- Ask naturally and only when relevant. Do not ask for contact details in every conversation.\n"
             "- Prefer collecting only the missing details needed for follow-up, such as name, email, phone, company, or requirement summary.\n"
             "- If the user has already shared any contact details, acknowledge that and never ask again for the same field.\n"
             "- If the user shared only part of the details, ask only for the missing ones. Example: if the user already shared name and email, politely ask only for the company name and phone number, and if still needed, the requirement summary.\n"
-            "- Only for an active demo request may you answer the inquiry and then ask for the customer's missing contact details for follow-up.\n"
-            "- If the user moves on to asking about products, services, pricing, or general information, answer that new topic directly and do not add any contact-details closing.\n"
-            "- Only when the demo flow is complete and all key customer details are already shared may you use a short polite sales-team handoff.\n"
-            "- For demo-flow contact handoffs, do NOT introduce the contact block with wording like 'Here are the contact details for scheduling your demo' or 'requesting demo contact this number and email'. Prefer optional quick-connect wording to the sales team instead.\n"
-            "- When asking for contact details, you may add one short reassurance such as 'Your details will only be used to follow up on this request and will be handled with care.' Keep it brief and professional.\n"
+            "- You may answer the high-intent inquiry and then ask for the customer's missing contact details for follow-up.\n"
+            "- If the user moves on to ordinary product, service, or general information questions that are not part of the active high-intent follow-up, answer that new topic directly and do not add any contact-details closing.\n"
+            "- When the user has shown interest in a specific product or service, acknowledge that offering by name if it is clear from the question or context.\n"
+            "- If you have just offered a demo for a specific product or service and the user replies with a clear confirmation like 'yes', treat that as continuing the same follow-up flow and collect the missing contact details instead of redirecting them to a generic form.\n"
+            "- Only when the high-intent follow-up is complete and all key customer details are already shared may you use a short polite confirmation that the team will follow up shortly, followed by an optional sales-team handoff.\n"
+            "- For contact handoffs, do NOT introduce the contact block with wording like 'Here are the contact details for scheduling your demo' or 'requesting demo contact this number and email'. Prefer optional quick-connect wording to the sales team instead.\n"
+            "- When asking for contact details or confirming follow-up, you may add one short reassurance such as 'Your details will only be used to follow up on this request and will be handled in line with our privacy practices.' Keep it brief and professional.\n"
             "- Keep the request short, professional, and helpful."
         )
 
@@ -794,11 +1145,35 @@ def build_messages(
             "\n\nIMPORTANT: This is a comparison question. "
             "Start with a warm friendly sentence like \"Sure! Here's a comparison of...\" or "
             "\"Great question! Let me break that down for you.\" "
+            "Compare products only against other products in the same category, and compare services only against other services in the same category. "
+            "Do not compare a product with a service, and do not mix items from different categories into the same comparison. "
+            "If the available context shows that the named items are different item types or belong to different categories, say that politely and explain that completely different items cannot be compared fairly because each category serves a different purpose. "
+            "Then ask the user to compare within the same category instead. "
             "Then list each item in plain text like:\n"
             "Basic Plan: $10/mo\nFeatures: Chat, Email\n\n"
             "Pro Plan: $25/mo\nFeatures: Chat, Email, API\n\n"
             "End with a varied human closing. "
             "Do NOT use tables or markdown. No robotic tone."
+        )
+
+    demo_target_clarification_hint = ""
+    if should_clarify_demo_target(question, conversation_history):
+        context_scope = offering_scope or detect_context_offering_scope(context)
+        if context_scope == "product":
+            clarification_example = "Which product would you like to book the appointment or demo for?"
+        elif context_scope == "service":
+            clarification_example = "Which service would you like to book the appointment or demo for?"
+        elif context_scope == "offering":
+            clarification_example = "Which product or service would you like to book the appointment or demo for?"
+        else:
+            clarification_example = "Which product or service would you like to book the appointment or demo for?"
+        demo_target_clarification_hint = (
+            "\n\nIMPORTANT: The user is asking for a demo or appointment, but they have NOT clearly said which "
+            "product, service, or solution they want. "
+            "Do NOT assume or infer a specific offering from the context. "
+            "Do NOT describe any specific product or service yet. "
+            "Instead, ask one short polite clarification question based on the available knowledge scope. "
+            f"For this case, use wording like: '{clarification_example}'"
         )
 
     pricing_hint = ""
@@ -822,6 +1197,9 @@ def build_messages(
             "Show each one on its own labeled line with clear labels such as Email and Phone. "
             "If no real contact details are present in the context, do not output any contact block. "
             "Never output placeholder values such as '[not available]', 'not available', 'N/A', 'NA', 'unknown', or '-'. "
+            "If lead capture is active for this conversation, you MUST also ask the customer for the missing follow-up details needed to prepare an accurate quote, such as name, email, phone number, company name, and the specific requirement or use case. "
+            "Do not ask again for any field the customer already shared. "
+            "For pricing or quote questions with lead capture enabled, do not end the reply without that customer-detail request. "
             "After sharing the contact details, end with one short professional follow-up invitation such as "
             "'If you'd like, I can also help with anything else you need.' or "
             "'Please let me know if there's anything else you'd like to know.' "
@@ -858,6 +1236,14 @@ def build_messages(
 
     list_scope_hint = ""
     list_category = detect_list_category(question) if is_list_question(question) else None
+    catalog_category_hint = ""
+    if re.search(r"(?im)^\s*(?:Product|Service) Category\s*:", context):
+        catalog_category_hint = (
+            "\n\nIMPORTANT: The context contains top-level catalog categories rather than individual products or services. "
+            "List those category names clearly and concisely. "
+            "Do NOT invent or expand into individual items unless the user asks for a specific category. "
+            "End with one short invitation asking which category they would like to explore."
+        )
     if list_category == "offering":
         list_scope_hint = (
             "\n\nIMPORTANT: This is a general offerings question. "
@@ -880,7 +1266,22 @@ def build_messages(
 
     lead_capture_hint = ""
     customer_detail_hint = ""
-    if lead_capture_enabled and should_apply_demo_lead_capture(question, conversation_history):
+    grounded_contact_details = _extract_grounded_contact_details(context)
+    grounded_contact_hint = (
+        "\n\nGROUNDED BUSINESS CONTACT DETAILS FROM CONTEXT:\n"
+        f"Email: {grounded_contact_details['email'] or 'missing'}\n"
+        f"Phone: {grounded_contact_details['phone'] or 'missing'}\n"
+        "If you include a sales or contact block in the final reply, copy only the exact values shown above. "
+        "Do not rewrite them, normalize them, or substitute example values. "
+        "If Email is marked missing, omit the Email line entirely. "
+        "If Phone is marked missing, omit the Phone line entirely. "
+        "Never invent a fallback contact number or email address."
+    )
+    if (
+        lead_capture_enabled
+        and should_apply_demo_lead_capture(question, conversation_history)
+        and not should_clarify_demo_target(question, conversation_history)
+    ):
         customer_detail_status = get_customer_detail_status(question, conversation_history)
         customer_detail_values = get_customer_detail_values(question, conversation_history)
         missing_details: list[str] = []
@@ -918,31 +1319,69 @@ def build_messages(
             elif len(provided_fields) == 2:
                 provided_text = f"{provided_fields[0]} and {provided_fields[1]}"
             elif not provided_fields:
-                provided_text = "the information already provided"
+                provided_text = ""
             else:
                 provided_text = ", ".join(provided_fields[:-1]) + f", and {provided_fields[-1]}"
 
-            lead_capture_hint = (
-                "\n\nIMPORTANT: This is an active demo-request follow-up. "
-                "The customer has already shared some contact details, but some details are still missing. "
-                "Do NOT show the sales team contact details in this case. "
-                "Instead, thank the customer naturally, acknowledge the details already shared, "
-                f"such as {provided_text}, "
-                f"and then politely ask only for the missing details: {missing_text}. "
-                "Do NOT ask again for any detail the customer already shared. "
-                "Add a short reassurance that their details will only be used to follow up on this request and will be handled with care. "
-                "Use a response style similar to: "
-                "'Thank you Sree, we got your name and email. Could you please share your company name and any specific requirements or use cases you have in mind? "
-                "Your details will only be used to follow up on this request and will be handled with care.'"
-            )
+            if is_pricing_question(question):
+                if provided_text:
+                    acknowledgement = (
+                        "thank the customer naturally, acknowledge the details already shared, "
+                        f"such as {provided_text}, "
+                    )
+                else:
+                    acknowledgement = "thank the customer naturally, "
+                lead_capture_hint = (
+                    "\n\nIMPORTANT: This is an active pricing or quote lead-capture follow-up. "
+                    "Your final reply MUST collect the missing customer details for quote follow-up. "
+                    "If pricing details are not available in the context, say that professionally and explain that pricing depends on the customer's exact requirements. "
+                    f"Then {acknowledgement}"
+                    f"and politely ask only for the missing details: {missing_text}. "
+                    "Do NOT ask again for any detail the customer already shared. "
+                    "If the context contains real sales-team contact details, you MUST add a short quick-connect handoff and show those contact details clearly on separate labeled lines after the request for missing customer details. "
+                    "If no real sales contact details are present in the context, omit that contact block. "
+                    "Add a short reassurance that their details will only be used to follow up on this request and will be handled in line with privacy practices. "
+                    "Do not end with only a generic pricing explanation. "
+                    "Use a professional style similar to: "
+                    "'Thank you for your interest in pricing. To help our team prepare an accurate quote, could you please share your name, email, phone number, company name, and specific requirements or use case? "
+                    "Your details will only be used to follow up on this request and will be handled in line with our privacy practices. "
+                    "If you would like to discuss your requirements directly with our sales team, please find the contact details below.'"
+                )
+            else:
+                if provided_text:
+                    acknowledgement = (
+                        "acknowledge the details already shared, "
+                        f"such as {provided_text}, "
+                    )
+                else:
+                    acknowledgement = "do not pretend the customer already shared details, "
+                lead_capture_hint = (
+                    "\n\nIMPORTANT: This is an active high-intent lead-capture follow-up. "
+                    "The customer has not yet shared all of the details needed for follow-up. "
+                    "Do NOT show the sales team contact details in this case. "
+                    "Instead, thank the customer naturally, "
+                    f"{acknowledgement}"
+                    f"and then politely ask only for the missing details: {missing_text}. "
+                    "Do NOT ask again for any detail the customer already shared. "
+                    "Add a short reassurance that their details will only be used to follow up on this request and will be handled in line with privacy practices. "
+                    "Use a response style similar to: "
+                    "'Thank you Sree, we got your name and email. Could you please share your company name and any specific requirements or use cases you have in mind? "
+                    "Your details will only be used to follow up on this request and will be handled in line with our privacy practices.'"
+                )
         else:
             lead_capture_hint = (
-                "\n\nIMPORTANT: This is an active demo-request follow-up and the customer has already shared all key follow-up details. "
+                "\n\nIMPORTANT: This is an active high-intent lead-capture follow-up and the customer has already shared all key follow-up details. "
                 "After addressing the request professionally, do NOT ask the customer to share their contact details again. "
-                "Instead, use a polite quick-connect handoff such as 'If you would like to discuss your requirements directly with our sales team, please find the contact details below.' "
+                "Instead, thank them for their interest in the relevant product or service, mention that the team will reach out shortly using the contact details shared, "
+                "and add a short reassurance that their information will only be used for follow-up and handled in line with privacy practices. "
+                "Then, if helpful, add a polite quick-connect handoff such as 'If you would like to discuss your business requirements directly with our sales team, please find the contact details below.' "
                 "Do NOT frame the contact block as 'for scheduling your demo' or similar. "
                 "Then include the sales email and sales phone if those details are available in the context, each on separate labeled lines such as Email and Phone. "
-                "If the context does not contain real sales contact details, do not invent them."
+                "If the context does not contain real sales contact details, do not invent them. "
+                "Use a response style similar to: "
+                "'Thank you for your interest in ERP-Integrated Field Service Management. We have noted your contact details, and our team will reach out to you shortly. "
+                "Your information will only be used for follow-up on this request and will be handled in line with our privacy practices. "
+                "If you would like to discuss your business requirements directly with our sales team, please find the contact details below.'"
             )
 
         detected_lines = [
@@ -975,11 +1414,14 @@ def build_messages(
         "Never say 'contact our team' when you already have an answer. "
         "Only if context has NO relevant info: use a warm fallback and show phone/email if in context."
         f"{comparison_hint}"
+        f"{demo_target_clarification_hint}"
         f"{pricing_hint}"
         f"{recommendation_hint}"
         f"{list_scope_hint}"
+        f"{catalog_category_hint}"
         f"{lead_capture_hint}"
         f"{customer_detail_hint}"
+        f"{grounded_contact_hint}"
         f"{_format_source_urls(source_urls)}"
     )
 

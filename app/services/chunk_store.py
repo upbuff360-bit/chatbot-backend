@@ -99,6 +99,27 @@ class ChunkStore:
         docs = await cursor.to_list(length=None)
         return [d["_id"] for d in docs]
 
+    async def get_offering_scope_by_agent(self, agent_id: str) -> str | None:
+        """
+        Return whether this agent's stored knowledge contains product chunks,
+        service chunks, or both.
+        """
+        product_exists = await self._chunks.find_one(
+            {"agent_id": agent_id, "category": "product"},
+            {"_id": 1},
+        )
+        service_exists = await self._chunks.find_one(
+            {"agent_id": agent_id, "category": "service"},
+            {"_id": 1},
+        )
+        if product_exists and service_exists:
+            return "offering"
+        if product_exists:
+            return "product"
+        if service_exists:
+            return "service"
+        return None
+
     async def get_text_snippet_and_qa_chunks_by_agent(self, agent_id: str) -> list[dict]:
         """
         Return ALL chunks for text_snippet and qa source types for this agent.
@@ -155,6 +176,40 @@ class ChunkStore:
                 "source_type": 1,
             },
         ).sort([("source_type", 1), ("source_name", 1), ("chunk_index", 1)]).limit(limit)
+        return await cursor.to_list(length=limit)
+
+    async def get_detail_chunks_by_agent_and_sources(
+        self,
+        agent_id: str,
+        *,
+        source_names: list[str],
+        limit: int = 20,
+    ) -> list[dict]:
+        """
+        Return detail chunks for the given source pages/files.
+
+        Used for grounded comparisons so the model sees details from the exact
+        items being compared, not just their summary labels.
+        """
+        normalized_sources = [str(source).strip() for source in source_names if str(source).strip()]
+        if not normalized_sources:
+            return []
+
+        cursor = self._chunks.find(
+            {
+                "agent_id": agent_id,
+                "chunk_type": "detail",
+                "source_name": {"$in": normalized_sources},
+            },
+            {
+                "_id": 1,
+                "content": 1,
+                "source_name": 1,
+                "category": 1,
+                "chunk_index": 1,
+                "source_type": 1,
+            },
+        ).sort([("source_name", 1), ("chunk_index", 1)]).limit(limit)
         return await cursor.to_list(length=limit)
 
     async def get_contact_chunks_by_agent(

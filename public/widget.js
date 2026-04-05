@@ -459,13 +459,7 @@
 
     const textEl = document.createElement("p");
     textEl.style.margin = "0";
-    textEl.innerHTML = text
-      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
-      .replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>")
-      .replace(/\*(.*?)\*/g,"<em>$1</em>")
-      .replace(/^- (.+)$/gm,"<li>$1</li>")
-      .replace(/(<li>.*<\/li>)/gs,"<ul style='margin:4px 0;padding-left:16px;'>$1</ul>")
-      .replace(/\n/g,"<br>");
+    textEl.innerHTML = _formatMessageHtml(text);
 
     const timeEl = document.createElement("p");
     timeEl.title = now.toLocaleString();
@@ -557,6 +551,70 @@
     typeNext();
 
     return wrap;
+  }
+
+  function _formatMessageHtml(text) {
+    return String(text || "")
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+      .replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>")
+      .replace(/\*(.*?)\*/g,"<em>$1</em>")
+      .replace(/^- (.+)$/gm,"<li>$1</li>")
+      .replace(/(<li>.*<\/li>)/gs,"<ul style='margin:4px 0;padding-left:16px;'>$1</ul>")
+      .replace(/\n/g,"<br>");
+  }
+
+  function createStreamingBotMessage() {
+    const now = new Date();
+    _insertDayDivider(now);
+
+    const wrap = document.createElement("div");
+    wrap.className = "cw-msg bot";
+
+    const stack = document.createElement("div");
+    stack.className = "cw-bot-stack";
+
+    const bub = document.createElement("div");
+    bub.className = "cw-bubble-text";
+
+    const textEl = document.createElement("p");
+    textEl.style.margin = "0";
+    bub.appendChild(textEl);
+
+    const timeEl = document.createElement("p");
+    timeEl.title = now.toLocaleString();
+    timeEl.style.cssText = `margin:4px 0 0;font-size:10px;opacity:0;text-align:left;font-family:system-ui,sans-serif;transition:opacity .3s;`;
+    timeEl.textContent = _timeAgo(now);
+    bub.appendChild(timeEl);
+
+    stack.appendChild(bub);
+    wrap.appendChild(stack);
+    messagesEl.appendChild(wrap);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    return { wrap, stack, textEl, timeEl, now };
+  }
+
+  function updateStreamingBotMessage(handle, text) {
+    if (!handle || !handle.textEl) return;
+    handle.textEl.innerHTML = _formatMessageHtml(text);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function finalizeStreamingBotMessage(handle, text, suggestions) {
+    if (!handle) return;
+    const finalText = String(text || "").trim() || "I don't have enough information to answer that.";
+    const messageSuggestions = withFallbackSuggestions("bot", finalText, suggestions);
+    handle.textEl.innerHTML = _formatMessageHtml(finalText);
+    handle.timeEl.style.opacity = "0.55";
+    if (messageSuggestions.length) {
+      const chipWrap = renderSuggestionChips(messageSuggestions);
+      if (chipWrap) handle.stack.appendChild(chipWrap);
+    }
+    _sessionMessages.push({ role: "bot", text: finalText, timestamp: handle.now.toISOString(), suggestions: messageSuggestions });
+    saveCurrentSession(_sessionMessages);
+    const timer = setInterval(() => { handle.timeEl.textContent = _timeAgo(handle.now); }, 60000);
+    setTimeout(() => clearInterval(timer), 3600000);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   function showTyping() {
@@ -688,6 +746,7 @@
     isLoading = true;
     sendEl.disabled = true;
     inputEl.disabled = true;
+    let streamHandle = null;
 
     addMessage("user", text);
     inputEl.value = "";
@@ -695,7 +754,7 @@
 
     try {
       const lastBotMessage = getLastBotMessage();
-      const res = await fetch(`${apiBase}/widget/chat`, {
+      const res = await fetch(`${apiBase}/widget/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -705,17 +764,98 @@
           last_bot_message: lastBotMessage,
         }),
       });
-      removeTyping();
-      if (res.ok) {
-        const data = await res.json();
-        conversationId = data.conversation_id;
-        typeMessage("bot", data.answer || "I don't have enough information to answer that.", data.suggestions || _starterSuggestions);
-        document.getElementById("cw-menu-end").classList.remove("disabled");
-      } else {
+      if (!res.ok || !res.body) {
+        removeTyping();
         typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.", _starterSuggestions);
+      } else {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let answerText = "";
+        let finalSuggestions = _starterSuggestions;
+        let receivedFirstToken = false;
+
+        const handleEvent = (rawEvent) => {
+          const normalized = String(rawEvent || "").replace(/\r/g, "").trim();
+          if (!normalized) return false;
+
+          let eventName = "message";
+          const dataLines = [];
+          normalized.split("\n").forEach((line) => {
+            if (line.startsWith("event:")) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+              let value = line.slice(5);
+              if (value.startsWith(" ")) value = value.slice(1);
+              dataLines.push(value);
+            }
+          });
+          const data = dataLines.join("\n");
+          if (!data) return false;
+
+          if (eventName === "meta") {
+            try {
+              const meta = JSON.parse(data);
+              if (meta && typeof meta.conversation_id === "string") {
+                conversationId = meta.conversation_id;
+              }
+              if (meta && Array.isArray(meta.suggestions)) {
+                finalSuggestions = meta.suggestions;
+              }
+            } catch {}
+            return false;
+          }
+          if (eventName === "error") {
+            throw new Error(data || "Streaming failed.");
+          }
+          if (eventName === "done" || data === "[DONE]") {
+            return true;
+          }
+
+          answerText += data.replace(/\\n/g, "\n");
+          if (!receivedFirstToken) {
+            removeTyping();
+            streamHandle = createStreamingBotMessage();
+            receivedFirstToken = true;
+          }
+          updateStreamingBotMessage(streamHandle, answerText);
+          return false;
+        };
+
+        let streamDone = false;
+        while (!streamDone) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const rawEvent = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            streamDone = handleEvent(rawEvent);
+            if (streamDone) break;
+            boundary = buffer.indexOf("\n\n");
+          }
+
+          if (done) {
+            if (!streamDone && buffer.trim()) {
+              handleEvent(buffer);
+            }
+            break;
+          }
+        }
+
+        removeTyping();
+        if (!streamHandle) {
+          streamHandle = createStreamingBotMessage();
+        }
+        finalizeStreamingBotMessage(streamHandle, answerText, finalSuggestions);
+        document.getElementById("cw-menu-end").classList.remove("disabled");
       }
     } catch {
       removeTyping();
+      if (streamHandle && streamHandle.wrap && streamHandle.wrap.parentNode) {
+        streamHandle.wrap.parentNode.removeChild(streamHandle.wrap);
+      }
       typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.", _starterSuggestions);
     } finally {
       isLoading = false;

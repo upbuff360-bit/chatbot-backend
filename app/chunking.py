@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
 
 try:
     import nltk
@@ -34,6 +35,59 @@ _NOISE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 _NUMBERED_SECTION_RE = re.compile(r"^\d+\.\s+")
+_GENERIC_PATH_SEGMENTS = {
+    "product", "products", "service", "services", "solution", "solutions",
+    "catalog", "catalogue", "shop", "store", "item", "items", "category",
+    "categories", "offerings", "offering",
+}
+_BREADCRUMB_SPLIT_RE = re.compile(r"\s*(?:>|»|→|\||/)\s*")
+
+
+_CATALOG_PAGE_TITLE_HINTS = {
+    "product": re.compile(r"(?i)\b(product\s*finder|product type|product category|our products|all products)\b"),
+    "service": re.compile(r"(?i)\b(service\s*finder|service type|service category|our services|all services)\b"),
+}
+_CATALOG_FILTER_HEADING_HINTS = {
+    "product": re.compile(r"(?i)^\s*(?:product\s*type|product\s*category|categories)\s*$"),
+    "service": re.compile(r"(?i)^\s*(?:service\s*type|service\s*category|categories)\s*$"),
+}
+_CATALOG_FILTER_STOP_RE = re.compile(
+    r"(?i)^\s*(?:join our email list|discover|about us|contact us|downloads|news room|careers|reach us|"
+    r"follow us|resources|view all resources|location finder|find products|find distributors|"
+    r"product information|product characteristics|client stories|core products|partnerships|"
+    r"related articles|related products|read more|view product|terms(?:\s*&\s*conditions)?|"
+    r"privacy policy|email|follow us)\s*$"
+)
+_CATALOG_FILTER_SKIP_VALUES = {
+    "discover",
+    "downloads",
+    "contact us",
+    "about us",
+    "careers",
+    "email",
+    "resources",
+    "location finder",
+    "product finder",
+    "service finder",
+}
+_CATEGORY_TOKEN_STOPWORDS = {
+    "and",
+    "for",
+    "the",
+    "with",
+    "your",
+    "our",
+    "from",
+    "into",
+    "type",
+    "types",
+    "category",
+    "categories",
+    "product",
+    "products",
+    "service",
+    "services",
+}
 
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
@@ -118,6 +172,7 @@ def generate_summary_chunk(
     url: str,
     text: str,
     category: str | None = None,
+    catalog_categories: list[str] | None = None,
 ) -> str:
     """
     Build a compact summary chunk for a single product or service page.
@@ -126,6 +181,8 @@ def generate_summary_chunk(
         Product: <title>
         or
         Service: <title>
+        Category: <main category>          # when inferable
+        Subcategory: <sub category>        # when inferable
         URL: <url>
         <first meaningful body lines, capped at 250 chars>
 
@@ -173,10 +230,21 @@ def generate_summary_chunk(
 
     summary_body = " ".join(body_lines).strip()
     label = "Service" if category == "service" else "Product"
+    catalog_meta = _extract_catalog_taxonomy(
+        title_clean,
+        url_clean,
+        all_lines,
+        category=category,
+        catalog_categories=catalog_categories,
+    )
 
     parts: list[str] = []
     if title_clean:
         parts.append(f"{label}: {title_clean}")
+    if catalog_meta["main_category"]:
+        parts.append(f"Category: {catalog_meta['main_category']}")
+    if catalog_meta["sub_category"]:
+        parts.append(f"Subcategory: {catalog_meta['sub_category']}")
     if url_clean:
         parts.append(f"URL: {url_clean}")
     if summary_body:
@@ -258,6 +326,264 @@ def _extract_catalog_sections(text: str, *, category: str, max_items: int) -> li
             break
 
     return cleaned_sections
+
+
+def _extract_catalog_taxonomy(
+    title: str,
+    url: str,
+    all_lines: list[str],
+    *,
+    category: str | None = None,
+    catalog_categories: list[str] | None = None,
+) -> dict[str, str | None]:
+    title_norm = _MULTISPACE_RE.sub(" ", (title or "").strip()).lower()
+
+    breadcrumb_meta = _extract_taxonomy_from_lines(all_lines, title_norm=title_norm)
+    if breadcrumb_meta["main_category"]:
+        return breadcrumb_meta
+
+    hinted_category = _match_catalog_category_hint(
+        title=title,
+        url=url,
+        lines=all_lines,
+        category=category,
+        catalog_categories=catalog_categories,
+    )
+    if hinted_category:
+        return {"main_category": hinted_category, "sub_category": None}
+
+    return _extract_taxonomy_from_url(url, title_norm=title_norm)
+
+
+def extract_site_catalog_categories(
+    pages: list[tuple[str, str, str]],
+    *,
+    category: str,
+) -> list[str]:
+    categories: list[str] = []
+    seen: set[str] = set()
+
+    for url, title, text in pages:
+        if not _is_catalog_landing_page(url, title, text, category=category):
+            continue
+        for label in _extract_filter_categories_from_text(text, category=category):
+            normalized = label.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            categories.append(label)
+    return categories
+
+
+def _is_catalog_landing_page(url: str, title: str, text: str, *, category: str) -> bool:
+    title_pattern = _CATALOG_PAGE_TITLE_HINTS.get(category)
+    heading_pattern = _CATALOG_FILTER_HEADING_HINTS.get(category)
+    text_window = (text or "")[:4000]
+    return bool(
+        (category == "product" and re.search(r"/products?$", (url or "").lower()))
+        or (category == "service" and re.search(r"/services?$", (url or "").lower()))
+        or (title_pattern and title_pattern.search(title or ""))
+        or (
+            "filter by" in text_window.lower()
+            and heading_pattern is not None
+            and heading_pattern.search(text_window)
+        )
+    )
+
+
+def _extract_filter_categories_from_text(text: str, *, category: str) -> list[str]:
+    heading_pattern = _CATALOG_FILTER_HEADING_HINTS.get(category)
+    if heading_pattern is None:
+        return []
+
+    lines = [_normalize_catalog_line(line) for line in str(text or "").splitlines() if line.strip()]
+    lines = [line for line in lines if line]
+    start_index: int | None = None
+
+    for idx, line in enumerate(lines[:120]):
+        if heading_pattern.match(line):
+            start_index = idx + 1
+            break
+        if line.lower().startswith("filter by"):
+            for look_ahead in range(idx + 1, min(idx + 8, len(lines))):
+                if heading_pattern.match(lines[look_ahead]):
+                    start_index = look_ahead + 1
+                    break
+            if start_index is not None:
+                break
+
+    if start_index is None:
+        return []
+
+    options: list[str] = []
+    seen: set[str] = set()
+    started = False
+    for line in lines[start_index:]:
+        if _CATALOG_FILTER_STOP_RE.match(line):
+            if started:
+                break
+            continue
+        if not _looks_like_filter_option(line):
+            if started and len(options) >= 3:
+                break
+            continue
+        started = True
+        normalized = line.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        options.append(line)
+    return options
+
+
+def _looks_like_filter_option(line: str) -> bool:
+    cleaned = _normalize_catalog_line(line)
+    if not cleaned or len(cleaned) > 60:
+        return False
+    if cleaned.lower() in _CATALOG_FILTER_SKIP_VALUES:
+        return False
+    if "@" in cleaned or cleaned.startswith("http"):
+        return False
+    if any(ch.isdigit() for ch in cleaned):
+        return False
+    if cleaned.endswith(":"):
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z&/+.-]*", cleaned)
+    return 1 <= len(words) <= 6
+
+
+def _match_catalog_category_hint(
+    *,
+    title: str,
+    url: str,
+    lines: list[str],
+    category: str | None,
+    catalog_categories: list[str] | None,
+) -> str | None:
+    if category not in {"product", "service"} or not catalog_categories:
+        return None
+
+    haystack_parts = [title or "", url or ""]
+    haystack_parts.extend(lines[:60])
+    haystack = _normalize_catalog_line(" ".join(haystack_parts)).lower()
+    if not haystack:
+        return None
+
+    best_label: str | None = None
+    best_score = 0
+    for label in catalog_categories:
+        label_norm = _normalize_catalog_line(label).lower()
+        if not label_norm:
+            continue
+        if label_norm in haystack:
+            score = 100 + len(label_norm)
+        else:
+            tokens = _category_tokens(label_norm)
+            if not tokens:
+                continue
+            hit_count = sum(1 for token in tokens if re.search(rf"\b{re.escape(token)}\b", haystack))
+            minimum_hits = 1 if len(tokens) <= 2 else 2
+            if hit_count < minimum_hits:
+                continue
+            score = hit_count * 10 + len(tokens)
+        if score > best_score:
+            best_score = score
+            best_label = label
+    return best_label
+
+
+def _category_tokens(value: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for raw in re.findall(r"[A-Za-z]+", (value or "").lower()):
+        token = raw[:-1] if raw.endswith("s") and len(raw) > 4 else raw
+        if len(token) < 3 or token in _CATEGORY_TOKEN_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def _extract_taxonomy_from_lines(
+    lines: list[str],
+    *,
+    title_norm: str,
+) -> dict[str, str | None]:
+    for raw_line in lines[:40]:
+        line = _normalize_catalog_line(raw_line)
+        if not line or len(line) > 180:
+            continue
+        if line.startswith("http://") or line.startswith("https://"):
+            continue
+        if _NOISE_LINE_RE.match(line) or _GENERIC_CATALOG_TITLE_RE.match(line):
+            continue
+
+        parts = [
+            part.strip()
+            for part in _BREADCRUMB_SPLIT_RE.split(line)
+            if part.strip()
+        ]
+        if len(parts) < 2:
+            continue
+
+        cleaned_parts = [_clean_taxonomy_part(part) for part in parts]
+        cleaned_parts = [part for part in cleaned_parts if part]
+        if len(cleaned_parts) < 2:
+            continue
+
+        main_category = cleaned_parts[0]
+        sub_category = cleaned_parts[1] if len(cleaned_parts) >= 3 else None
+        if title_norm and _MULTISPACE_RE.sub(" ", main_category.lower()) == title_norm:
+            continue
+        return {
+            "main_category": main_category,
+            "sub_category": sub_category,
+        }
+
+    return {"main_category": None, "sub_category": None}
+
+
+def _extract_taxonomy_from_url(url: str, *, title_norm: str) -> dict[str, str | None]:
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return {"main_category": None, "sub_category": None}
+
+    segments = [
+        _clean_taxonomy_part(segment)
+        for segment in (parsed.path or "").split("/")
+        if segment.strip()
+    ]
+    segments = [
+        segment
+        for segment in segments
+        if segment
+        and segment.lower() not in _GENERIC_PATH_SEGMENTS
+        and not re.fullmatch(r"\d+", segment)
+    ]
+    if not segments:
+        return {"main_category": None, "sub_category": None}
+
+    if title_norm and _MULTISPACE_RE.sub(" ", segments[0].lower()) == title_norm:
+        return {"main_category": None, "sub_category": None}
+
+    main_category = segments[0]
+    sub_category = segments[1] if len(segments) >= 3 else None
+    return {"main_category": main_category, "sub_category": sub_category}
+
+
+def _clean_taxonomy_part(value: str) -> str | None:
+    cleaned = _normalize_catalog_line(value)
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if lowered in _GENERIC_PATH_SEGMENTS:
+        return None
+    if re.fullmatch(r"[a-z]{2}-[a-z]{2}", lowered):
+        return None
+    return cleaned
 
 
 def _extract_lines_from_category_section(raw_lines: list[str], *, category: str) -> list[str]:

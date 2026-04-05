@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 load_dotenv()
 
 from app.db.connection import connect, create_indexes, disconnect, get_database
+from app.chunking import extract_site_catalog_categories
 from app.core.dependencies import CurrentUser, get_current_user
 from app.crawl_job_store import CrawlJobStore
 from app.recrawl_log_store import RecrawlLogEntry, RecrawlLogStore
@@ -364,6 +365,15 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
                 None,
                 lambda b=batch: website_service._merge_and_save_pages(url, b),
             )
+            accumulated_pages = website_service.list_source_pages(url)
+            product_categories = extract_site_catalog_categories(
+                [(page.url, page.title, page.text) for page in accumulated_pages if page.text.strip()],
+                category="product",
+            )
+            service_categories = extract_site_catalog_categories(
+                [(page.url, page.title, page.text) for page in accumulated_pages if page.text.strip()],
+                category="service",
+            )
 
             # Ingest every page in this batch into Qdrant
             await crawl_job_store.update(
@@ -391,6 +401,11 @@ async def _run_crawl(job_id: str, agent_id: str, tenant_id: str, user_id: str, u
                     category=page_category,
                     page_title=page.title,
                     page_url=page.url,
+                    catalog_categories=(
+                        product_categories
+                        if page_category == "product"
+                        else service_categories if page_category == "service" else None
+                    ),
                 )
                 indexed += 1
                 if not display_name or display_name == url:
@@ -512,6 +527,14 @@ async def _run_single_page_crawl(
             await chunk_store.delete_chunks_by_document(document["id"])
 
         # Re-ingest all pages (including the new one) with category detection
+        product_categories = extract_site_catalog_categories(
+            [(page.url, page.title, page.text) for page in pages if page.text.strip()],
+            category="product",
+        )
+        service_categories = extract_site_catalog_categories(
+            [(page.url, page.title, page.text) for page in pages if page.text.strip()],
+            category="service",
+        )
         for page in pages:
             page_text = page.text.strip()
             if not page_text:
@@ -528,6 +551,11 @@ async def _run_single_page_crawl(
                 category=page_category,
                 page_title=page.title,
                 page_url=page.url,
+                catalog_categories=(
+                    product_categories
+                    if page_category == "product"
+                    else service_categories if page_category == "service" else None
+                ),
             )
 
         # Persist the updated page URL list to MongoDB so the Knowledge tab
@@ -729,6 +757,15 @@ async def _run_single_url_crawl(
         page_text = page.text.strip()
         page_category = detect_page_category(url=page.url, title=page.title, text=page_text)
         page_input = f"{page.title}\n\n{page.url}\n\n{page_text}"
+        accumulated_pages = website_service.list_source_pages(url)
+        product_categories = extract_site_catalog_categories(
+            [(saved.url, saved.title, saved.text) for saved in accumulated_pages if saved.text.strip()],
+            category="product",
+        )
+        service_categories = extract_site_catalog_categories(
+            [(saved.url, saved.title, saved.text) for saved in accumulated_pages if saved.text.strip()],
+            category="service",
+        )
         await pipeline.ingest_single_document(
             chunk_store=chunk_store,
             tenant_id=tenant_id, agent_id=agent_id,
@@ -739,6 +776,11 @@ async def _run_single_url_crawl(
             category=page_category,
             page_title=page.title,
             page_url=page.url,
+            catalog_categories=(
+                product_categories
+                if page_category == "product"
+                else service_categories if page_category == "service" else None
+            ),
         )
 
         doc = await store.upsert_website_source(

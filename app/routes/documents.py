@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.core.dependencies import CurrentUser, get_current_user
 from app.category_detector import detect_document_category, detect_page_category
+from app.chunking import extract_site_catalog_categories
 from app.models.document import DocumentResponse, DocumentUpdateRequest
 from app.models.user import UserRole
 from app.rag_pipeline import RAGPipeline
@@ -164,6 +165,15 @@ async def _reindex_website_document(
     if not valid_pages:
         raise ValueError("Website pages must contain readable text.")
 
+    product_categories = extract_site_catalog_categories(
+        [(page.url, page.title, page.text) for page in valid_pages],
+        category="product",
+    )
+    service_categories = extract_site_catalog_categories(
+        [(page.url, page.title, page.text) for page in valid_pages],
+        category="service",
+    )
+
     for page in valid_pages:
         page_text = page.text.strip()
         page_category = detect_page_category(
@@ -182,6 +192,11 @@ async def _reindex_website_document(
             category=page_category,
             page_title=page.title,
             page_url=page.url,
+            catalog_categories=(
+                product_categories
+                if page_category == "product"
+                else service_categories if page_category == "service" else None
+            ),
         )
 
     display_name = valid_pages[0].title.strip() or source_url
@@ -355,6 +370,14 @@ async def crawl_website(
             raise ValueError("No text could be extracted from the website.")
 
         pipeline = _build_pipeline(store, agent_id)
+        product_categories = extract_site_catalog_categories(
+            [(page.url, page.title, page.text) for page in valid_pages],
+            category="product",
+        )
+        service_categories = extract_site_catalog_categories(
+            [(page.url, page.title, page.text) for page in valid_pages],
+            category="service",
+        )
 
         # Ingest each crawled page as a separate document so every page
         # gets its own focused embeddings — fixes partial product retrieval.
@@ -385,6 +408,11 @@ async def crawl_website(
                 category=page_category,
                 page_title=page.title,
                 page_url=page.url,
+                catalog_categories=(
+                    product_categories
+                    if page_category == "product"
+                    else service_categories if page_category == "service" else None
+                ),
             )
             await store.mark_document_uploaded(
                 agent_id, tenant_id, user.id,

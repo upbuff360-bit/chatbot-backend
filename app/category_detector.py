@@ -26,7 +26,9 @@ _SERVICE_URL_PATTERNS = re.compile(
 _GENERAL_URL_PATTERNS = re.compile(
     r"/(about|contact|legal|terms|privacy|cookie|cookies|data-protection|"
     r"gdpr|career|careers|blog|blogs|news|press|case-stud(?:y|ies)|"
-    r"documentation|docs|faq|faqs|industry|industries|request-demo|demo)/",
+    r"documentation|docs|faq|faqs|industry|industries|request-demo|demo|"
+    r"download|downloads|company|history|management|leadership|team|"
+    r"client|clients|location|locations)/",
     re.IGNORECASE,
 )
 
@@ -50,7 +52,9 @@ _SERVICE_KEYWORDS = re.compile(
 )
 _GENERAL_TITLE_KEYWORDS = re.compile(
     r"\b(about|contact|get in touch|terms|privacy|policy|data protection|"
-    r"cookie policy|careers|blog|news|press|documentation|faq|request a demo|demo)\b",
+    r"cookie policy|careers|blog|news|press|documentation|faq|request a demo|demo|"
+    r"product finder|service finder|downloads?|company history|history|leadership|"
+    r"management|our clients|clients|locations?)\b",
     re.IGNORECASE,
 )
 
@@ -75,6 +79,9 @@ def detect_page_category(
 
     parsed_url = urlparse(url_lower)
     url_path = parsed_url.path or "/"
+
+    if url_path in {"/product", "/products", "/service", "/services", "/industry", "/industries"}:
+        return "general"
 
     # Non-catalog pages often mention products/services in legal or company copy,
     # but they should never appear as product/service listings.

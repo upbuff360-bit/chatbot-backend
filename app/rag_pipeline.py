@@ -13,7 +13,13 @@ from app.chunking import chunk_text
 from app.embedding_service import EmbeddingService
 from app.manual_knowledge_service import ManualKnowledgeService
 from app.pdf_service import PDFService
-from app.prompt_builder import build_messages, expand_query, is_comparison_question, is_list_question
+from app.prompt_builder import (
+    build_messages,
+    build_required_lead_capture_followup,
+    expand_query,
+    is_comparison_question,
+    is_list_question,
+)
 from app.vector_store import VectorStore
 from app.website_service import WebsiteService
 
@@ -78,7 +84,9 @@ class RAGPipeline:
         self.vector_store = VectorStore(collection_name=collection_name)
         self.similarity_threshold = float(os.getenv("SIMILARITY_THRESHOLD", "0.15"))
         self.relaxed_similarity_threshold = float(os.getenv("RELAXED_SIMILARITY_THRESHOLD", "0.08"))
-        self.retrieval_limit = int(os.getenv("RETRIEVAL_LIMIT", "8"))
+        self.retrieval_limit = int(os.getenv("RETRIEVAL_LIMIT", "5"))
+        self.max_context_chunks = int(os.getenv("CONTEXT_MAX_CHUNKS", "8"))
+        self.max_context_chars = int(os.getenv("CONTEXT_MAX_CHARS", "12000"))
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.llm_client = OpenAI(api_key=api_key) if api_key else None
 
@@ -96,6 +104,7 @@ class RAGPipeline:
         category: str | None = None,
         page_title: str = "",
         page_url: str = "",
+        catalog_categories: list[str] | None = None,
     ) -> int:
         """
         Ingest one document: save chunks to MongoDB then embed into Qdrant.
@@ -133,6 +142,7 @@ class RAGPipeline:
                     url=page_url,
                     text=text,
                     category=category,
+                    catalog_categories=catalog_categories,
                 )
                 if summary_text.strip():
                     summary_texts.append(summary_text)
@@ -275,8 +285,6 @@ class RAGPipeline:
         if not self.vector_store.collection_exists():
             return [], []
 
-        # Enhancement 5: LLM-assisted query expansion
-        query_variants = expand_query(question, llm_client=self.llm_client)
         all_matches: list = []
         seen_ids: set = set()
 
@@ -292,21 +300,42 @@ class RAGPipeline:
             retrieval_limit = self.retrieval_limit
             threshold = self.similarity_threshold
 
-        for variant in query_variants:
-            variant_embedding = self.embedding_service.embed_query(variant)
-            for m in self.vector_store.search(
-                query_embedding=variant_embedding,
-                limit=retrieval_limit,
-                score_threshold=threshold,
-            ):
-                mid = str(getattr(m, "id", None) or id(m))
-                if mid not in seen_ids:
-                    seen_ids.add(mid)
-                    all_matches.append(m)
+        def _search_variants(variants: list[str], *, limit: int, score_threshold: float) -> None:
+            for variant in variants:
+                variant_embedding = self.embedding_service.embed_query(variant)
+                for m in self.vector_store.search(
+                    query_embedding=variant_embedding,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                ):
+                    mid = str(getattr(m, "id", None) or id(m))
+                    if mid not in seen_ids:
+                        seen_ids.add(mid)
+                        all_matches.append(m)
+
+        query_variants = expand_query(question, llm_client=None)
+        attempted_variants = list(query_variants)
+        _search_variants(query_variants, limit=retrieval_limit, score_threshold=threshold)
+
+        should_try_llm_rewrite = self.llm_client is not None and not is_list_question(question)
+        if not all_matches and should_try_llm_rewrite:
+            llm_variants = expand_query(
+                question,
+                llm_client=self.llm_client,
+                allow_llm_rewrite=True,
+            )
+            retry_variants = [
+                variant
+                for variant in llm_variants
+                if variant.lower() not in {existing.lower() for existing in attempted_variants}
+            ]
+            if retry_variants:
+                attempted_variants.extend(retry_variants)
+                _search_variants(retry_variants, limit=retrieval_limit, score_threshold=threshold)
 
         # Relaxed fallback
         if not all_matches:
-            for variant in query_variants:
+            for variant in attempted_variants:
                 variant_embedding = self.embedding_service.embed_query(variant)
                 for m in self.vector_store.search(
                     query_embedding=variant_embedding,
@@ -351,6 +380,7 @@ class RAGPipeline:
         conversation_history: list[dict[str, str]] | None = None,
         prefetched_context: list[dict] | None = None,
         lead_capture_enabled: bool = False,
+        offering_scope: str | None = None,
     ) -> str:
         """
         Return a complete answer string (non-streaming).
@@ -371,6 +401,7 @@ class RAGPipeline:
             conversation_history=conversation_history,
             source_urls=source_urls,
             lead_capture_enabled=lead_capture_enabled,
+            offering_scope=offering_scope,
         )
         response = self.llm_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -380,7 +411,16 @@ class RAGPipeline:
             # most probable token.
             temperature=min(temperature, 0.7),
         )
-        return (response.choices[0].message.content or FALLBACK_ANSWER).strip()
+        answer = (response.choices[0].message.content or FALLBACK_ANSWER).strip()
+        followup = build_required_lead_capture_followup(
+            question,
+            answer,
+            conversation_history,
+            lead_capture_enabled=lead_capture_enabled,
+        )
+        if followup:
+            answer = f"{answer}\n\n{followup}".strip()
+        return answer
 
     # ── Enhancement 3: Streaming answer ───────────────────────────────────────
 
@@ -392,6 +432,7 @@ class RAGPipeline:
         conversation_history: list[dict[str, str]] | None = None,
         prefetched_context: list[dict] | None = None,
         lead_capture_enabled: bool = False,
+        offering_scope: str | None = None,
     ) -> Generator[str, None, None]:
         """
         Yield answer tokens as they arrive from OpenAI (Server-Sent Events).
@@ -421,6 +462,7 @@ class RAGPipeline:
             conversation_history=conversation_history,
             source_urls=source_urls,
             lead_capture_enabled=lead_capture_enabled,
+            offering_scope=offering_scope,
         )
 
         stream = self.llm_client.chat.completions.create(
@@ -430,10 +472,23 @@ class RAGPipeline:
             stream=True,
         )
 
+        streamed_parts: list[str] = []
         for chunk in stream:
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
+                streamed_parts.append(delta.content)
                 yield delta.content
+
+        full_answer = "".join(streamed_parts).strip()
+
+        followup = build_required_lead_capture_followup(
+            question,
+            full_answer,
+            conversation_history,
+            lead_capture_enabled=lead_capture_enabled,
+        )
+        if followup:
+            yield "\n\n" + followup
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -445,13 +500,43 @@ class RAGPipeline:
         source_urls: list[str] = []
         seen_urls: set[str] = set()
         seen_chunks: set[str] = set()
+        total_chars = 0
+        catalog_entries: list[str] = []
+
+        for item in (prefetched_context or []):
+            content = item.get("content", "").strip()
+            if re.match(r"(?im)^\s*(?:Product|Service) Category\s*:", content):
+                if content not in seen_chunks:
+                    seen_chunks.add(content)
+                    catalog_entries.append(content)
+            source_name = item.get("source_name", "unknown")
+            if source_name.startswith("http") and source_name not in seen_urls:
+                seen_urls.add(source_name)
+                source_urls.append(source_name)
+
+        if catalog_entries:
+            catalog_block = "[Source: catalog]\n" + "\n\n".join(catalog_entries)
+            context_parts.append(catalog_block)
+            total_chars = len(catalog_block)
 
         for item in (prefetched_context or []):
             content     = item.get("content", "").strip()
             source_name = item.get("source_name", "unknown")
+            if re.match(r"(?im)^\s*(?:Product|Service) Category\s*:", content):
+                continue
             if content and content not in seen_chunks:
+                next_part = f"[Source: {source_name}]\n{content}"
+                if context_parts:
+                    projected_chars = total_chars + 2 + len(next_part)
+                else:
+                    projected_chars = total_chars + len(next_part)
+                if len(context_parts) >= self.max_context_chunks or (
+                    context_parts and projected_chars > self.max_context_chars
+                ):
+                    break
                 seen_chunks.add(content)
-                context_parts.append(f"[Source: {source_name}]\n{content}")
+                context_parts.append(next_part)
+                total_chars = projected_chars
             if source_name.startswith("http") and source_name not in seen_urls:
                 seen_urls.add(source_name)
                 source_urls.append(source_name)

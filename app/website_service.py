@@ -54,6 +54,13 @@ _BLOCK_RESOURCE_TYPES: frozenset[str] = frozenset({
     "image", "media", "font",
 })
 
+_EXCLUDED_CRAWL_URL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)(?:^|[-_/])thank(?:[-_\s]*you)(?:$|[-_/])"),
+    re.compile(r"(?i)(?:^|[-_/])(?:login|log-in|signin|sign-in)(?:$|[-_/])"),
+    re.compile(r"(?i)(?:^|[-_/])(?:register|registration|signup|sign-up)(?:$|[-_/])"),
+    re.compile(r"(?i)(?:^|[-_/])(?:forgot[-_\s]*password|reset[-_\s]*password)(?:$|[-_/])"),
+)
+
 
 # ---------------------------------------------------------------------------
 # Data-transfer objects
@@ -667,6 +674,8 @@ class WebsiteService:
              fall back to a headless browser render of just that one URL.
         """
         normalized_url = self._normalize_url(url)
+        if self._should_exclude_crawl_url(normalized_url):
+            raise ValueError("This URL is excluded from crawling.")
 
         # ── Try plain HTTP first ──────────────────────────────────────────
         try:
@@ -769,6 +778,9 @@ class WebsiteService:
         )
 
         for url in urls[: self.max_pages]:
+            if self._should_exclude_crawl_url(url):
+                logger.debug("Skipping excluded sitemap URL: %s", url)
+                continue
             try:
                 html, _ = self._fetch(url)
             except Exception as exc:
@@ -856,7 +868,10 @@ class WebsiteService:
                 urls.extend(self._extract_sitemap_urls(nested_xml, nested_url))
                 if len(urls) >= self.max_pages:
                     break
-            return urls[: self.max_pages]
+            return [
+                url for url in urls
+                if not self._should_exclude_crawl_url(url)
+            ][: self.max_pages]
 
         # Standard urlset
         if root.tag.endswith("urlset"):
@@ -864,6 +879,7 @@ class WebsiteService:
                 loc_text
                 for loc in root.findall(f".//{ns}url/{ns}loc")
                 if (loc_text := (loc.text or "").strip())
+                and not self._should_exclude_crawl_url(loc_text)
             ][: self.max_pages]
 
         # Unknown XML root – treat the source URL itself as the only entry
@@ -1030,6 +1046,8 @@ class WebsiteService:
                     current_url = queue.pop(0)
                     if current_url in seen:
                         continue
+                    if self._should_exclude_crawl_url(current_url):
+                        continue
                     seen.add(current_url)
 
                     pw_page = await ctx.new_page()
@@ -1074,6 +1092,10 @@ class WebsiteService:
                         final_url = self._normalize_url(pw_page.url or current_url)
                     except Exception:
                         final_url = current_url
+
+                    if self._should_exclude_crawl_url(final_url):
+                        await pw_page.close()
+                        continue
 
                     if response is not None and int(response.status) >= 400:
                         logger.debug(
@@ -1239,6 +1261,8 @@ class WebsiteService:
         while queue and len(pages) < self.max_pages:
             current = queue.pop(0)
             if current in seen:
+                continue
+            if self._should_exclude_crawl_url(current):
                 continue
             seen.add(current)
 
@@ -1526,7 +1550,24 @@ class WebsiteService:
         parsed = urlparse(absolute)
         if parsed.scheme not in {"http", "https"}:
             return None
-        return WebsiteService._normalize_url(parsed._replace(fragment="").geturl())
+        normalized = WebsiteService._normalize_url(parsed._replace(fragment="").geturl())
+        if WebsiteService._should_exclude_crawl_url(normalized):
+            return None
+        return normalized
+
+    @staticmethod
+    def _should_exclude_crawl_url(url: str) -> bool:
+        parsed = urlparse(url or "")
+        haystacks = [
+            parsed.path or "",
+            parsed.query or "",
+            parsed.fragment or "",
+        ]
+        return any(
+            pattern.search(value)
+            for value in haystacks
+            for pattern in _EXCLUDED_CRAWL_URL_PATTERNS
+        )
 
     @staticmethod
     def _canonical_netloc(netloc: str) -> str:
