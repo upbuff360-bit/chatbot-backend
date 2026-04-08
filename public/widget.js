@@ -112,16 +112,6 @@
     .cw-bubble-text{padding:9px 13px;font-size:13px;line-height:1.55;font-family:system-ui,sans-serif;white-space:pre-wrap;word-break:break-word;}
     .cw-msg.user .cw-bubble-text{background:${currentPrimaryColor};color:#fff;border-radius:16px 16px 4px 16px;}
     .cw-msg.bot  .cw-bubble-text{background:${bubbleBg};color:${textColor};border:1px solid ${bubbleBorder};border-radius:4px 16px 16px 16px;}
-    .cw-bot-stack{display:flex;flex-direction:column;gap:8px;max-width:84%;}
-    .cw-suggestions{display:flex;flex-wrap:wrap;gap:8px;margin-left:2px;}
-    .cw-chip{
-      border:1px solid ${bubbleBorder};background:${bgColor};color:${textColor};
-      border-radius:999px;padding:6px 11px;font-size:12px !important;line-height:1.25;
-      font-family:system-ui,sans-serif;cursor:pointer;transition:all .15s;
-      box-shadow:0 1px 2px rgba(0,0,0,.04);
-    }
-    .cw-chip:hover{border-color:${currentPrimaryColor};color:${currentPrimaryColor};transform:translateY(-1px);}
-    .cw-chip:disabled{opacity:.55;cursor:not-allowed;transform:none;}
 
     .cw-typing{display:flex;align-items:center;gap:4px;padding:10px 14px;background:${bubbleBg};border:1px solid ${bubbleBorder};border-radius:4px 16px 16px 16px;align-self:flex-start;}
     .cw-dot{width:6px;height:6px;border-radius:50%;background:${subText};animation:cw-bounce .9s infinite;}
@@ -299,12 +289,7 @@
   let conversationId  = null;
   let _localSessionId = "local_" + Date.now(); // stable ID for this session
   let _welcomeMsg     = "Hi! What can I help you with?";
-  let _starterSuggestions = [
-    "What do you offer?",
-    "How can you help?",
-    "Tell me more about your company",
-    "How do I get started?",
-  ];
+  let _starterSuggestions = [];
   let _lastDay        = "";
   let _showingHistory = false;
 
@@ -346,7 +331,7 @@
       conversationId: conversationId || null, // keep for reference
       title:        messages.find(m => m.role === "user")?.text || "Chat session",
       updatedAt:    new Date().toISOString(),
-      messages:     messages.map(m => ({ role: m.role, text: m.text, timestamp: m.timestamp, suggestions: m.suggestions || [] })),
+      messages:     messages.map(m => ({ role: m.role, text: m.text, timestamp: m.timestamp })),
     };
     if (existing >= 0) history[existing] = session;
     else history.unshift(session);
@@ -385,21 +370,6 @@
     messagesEl.appendChild(d);
   }
 
-  function normalizeSuggestions(suggestions) {
-    if (!Array.isArray(suggestions)) return [];
-    const seen = new Set();
-    const cleaned = [];
-    for (const item of suggestions) {
-      const value = String(item || "").trim();
-      const key = value.toLowerCase();
-      if (!value || seen.has(key)) continue;
-      seen.add(key);
-      cleaned.push(value);
-      if (cleaned.length >= 4) break;
-    }
-    return cleaned;
-  }
-
   function getLastBotMessage() {
     for (let i = _sessionMessages.length - 1; i >= 0; i -= 1) {
       const message = _sessionMessages[i];
@@ -410,45 +380,8 @@
     return "";
   }
 
-  function renderSuggestionChips(suggestions) {
-    return null;
-    const items = normalizeSuggestions(suggestions);
-    if (!items.length) return null;
-
-    const wrap = document.createElement("div");
-    wrap.className = "cw-suggestions";
-
-    items.forEach((label) => {
-      const chip = document.createElement("button");
-      chip.type = "button";
-      chip.className = "cw-chip";
-      chip.textContent = label;
-      chip.addEventListener("click", () => {
-        if (isLoading) return;
-        inputEl.value = label;
-        sendMessage(label);
-      });
-      wrap.appendChild(chip);
-    });
-
-    return wrap;
-  }
-
-  function withFallbackSuggestions(role, text, suggestions) {
-    const normalized = normalizeSuggestions(suggestions);
-    if (role !== "bot" || normalized.length) return normalized;
-
-    const message = String(text || "").trim();
-    if (!message) return normalized;
-
-    if (message === _welcomeMsg || /^hi[!,. ]|^hello[!,. ]|^good (morning|afternoon|evening)/i.test(message)) {
-      return normalizeSuggestions(_starterSuggestions);
-    }
-    return normalized;
-  }
-
   // ── Message helpers ───────────────────────────────────────────────────────────
-  function addMessage(role, text, timestamp, suggestions) {
+  function addMessage(role, text, timestamp) {
     const now = timestamp ? new Date(timestamp) : new Date();
     _insertDayDivider(now);
 
@@ -466,11 +399,9 @@
     timeEl.title = now.toLocaleString();
     timeEl.style.cssText = `margin:4px 0 0;font-size:10px;opacity:0.55;text-align:${role==="user"?"right":"left"};font-family:system-ui,sans-serif;`;
     timeEl.textContent = _timeAgo(now);
-    const messageSuggestions = withFallbackSuggestions(role, text, suggestions);
 
     if (!timestamp) {
-      // Save immediately for both user and bot messages
-      _sessionMessages.push({ role, text, timestamp: now.toISOString(), suggestions: messageSuggestions });
+      _sessionMessages.push({ role, text, timestamp: now.toISOString() });
       saveCurrentSession(_sessionMessages);
       const timer = setInterval(() => { timeEl.textContent = _timeAgo(now); }, 60000);
       setTimeout(() => clearInterval(timer), 3600000);
@@ -478,22 +409,13 @@
 
     bub.appendChild(textEl);
     bub.appendChild(timeEl);
-    if (role === "bot" && messageSuggestions.length) {
-      const stack = document.createElement("div");
-      stack.className = "cw-bot-stack";
-      stack.appendChild(bub);
-      const chipWrap = renderSuggestionChips(messageSuggestions);
-      if (chipWrap) stack.appendChild(chipWrap);
-      wrap.appendChild(stack);
-    } else {
-      wrap.appendChild(bub);
-    }
+    wrap.appendChild(bub);
     messagesEl.appendChild(wrap);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return wrap;
   }
 
-  function typeMessage(role, text, suggestions) {
+  function typeMessage(role, text) {
     const now = new Date();
     _insertDayDivider(now);
 
@@ -513,21 +435,10 @@
     timeEl.textContent = _timeAgo(now);
     bub.appendChild(timeEl);
 
-    const messageSuggestions = withFallbackSuggestions(role, text, suggestions);
-    let chipWrap = null;
-    if (role === "bot" && messageSuggestions.length) {
-      const stack = document.createElement("div");
-      stack.className = "cw-bot-stack";
-      stack.appendChild(bub);
-      chipWrap = renderSuggestionChips(messageSuggestions);
-      wrap.appendChild(stack);
-    } else {
-      wrap.appendChild(bub);
-    }
+    wrap.appendChild(bub);
     messagesEl.appendChild(wrap);
 
-    // Save to session immediately — don't wait for typing to finish
-    _sessionMessages.push({ role, text, timestamp: now.toISOString(), suggestions: messageSuggestions });
+    _sessionMessages.push({ role, text, timestamp: now.toISOString() });
     saveCurrentSession(_sessionMessages);
 
     // Type characters one by one
@@ -539,12 +450,7 @@
         messagesEl.scrollTop = messagesEl.scrollHeight;
         setTimeout(typeNext, speed);
       } else {
-        // Typing done — show timestamp
         timeEl.style.opacity = "0.55";
-        if (chipWrap) {
-          const stack = wrap.firstChild;
-          stack.appendChild(chipWrap);
-        }
         const timer = setInterval(() => { timeEl.textContent = _timeAgo(now); }, 60000);
         setTimeout(() => clearInterval(timer), 3600000);
       }
@@ -571,9 +477,6 @@
     const wrap = document.createElement("div");
     wrap.className = "cw-msg bot";
 
-    const stack = document.createElement("div");
-    stack.className = "cw-bot-stack";
-
     const bub = document.createElement("div");
     bub.className = "cw-bubble-text";
 
@@ -587,12 +490,11 @@
     timeEl.textContent = _timeAgo(now);
     bub.appendChild(timeEl);
 
-    stack.appendChild(bub);
-    wrap.appendChild(stack);
+    wrap.appendChild(bub);
     messagesEl.appendChild(wrap);
     messagesEl.scrollTop = messagesEl.scrollHeight;
 
-    return { wrap, stack, textEl, timeEl, now };
+    return { wrap, bub, textEl, timeEl, now };
   }
 
   function updateStreamingBotMessage(handle, text) {
@@ -601,17 +503,12 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function finalizeStreamingBotMessage(handle, text, suggestions) {
+  function finalizeStreamingBotMessage(handle, text) {
     if (!handle) return;
     const finalText = String(text || "").trim() || "I don't have enough information to answer that.";
-    const messageSuggestions = withFallbackSuggestions("bot", finalText, suggestions);
     handle.textEl.innerHTML = _formatMessageHtml(finalText);
     handle.timeEl.style.opacity = "0.55";
-    if (messageSuggestions.length) {
-      const chipWrap = renderSuggestionChips(messageSuggestions);
-      if (chipWrap) handle.stack.appendChild(chipWrap);
-    }
-    _sessionMessages.push({ role: "bot", text: finalText, timestamp: handle.now.toISOString(), suggestions: messageSuggestions });
+    _sessionMessages.push({ role: "bot", text: finalText, timestamp: handle.now.toISOString() });
     saveCurrentSession(_sessionMessages);
     const timer = setInterval(() => { handle.timeEl.textContent = _timeAgo(handle.now); }, 60000);
     setTimeout(() => clearInterval(timer), 3600000);
@@ -650,7 +547,6 @@
   }
 
   function renderHistory() {
-    // Save current session first so it appears in history
     if (_sessionMessages.length) saveCurrentSession(_sessionMessages);
 
     const history = loadHistory();
@@ -661,7 +557,6 @@
       return;
     }
 
-    // Sort descending by updatedAt — most recent first
     const sorted = [...history].sort((a, b) =>
       new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
     );
@@ -670,8 +565,7 @@
       const item = document.createElement("div");
       item.className = "cw-hist-item";
       const msgCount = session.messages.length;
-      // Highlight current active session
-      if (session.id === conversationId || 
+      if (session.id === conversationId ||
           (!conversationId && session.id === sorted[0].id)) {
         item.style.borderLeft = `3px solid ${currentPrimaryColor}`;
         item.style.paddingLeft = "11px";
@@ -690,9 +584,8 @@
     _localSessionId = session.id;
     conversationId  = session.conversationId || null;
     _sessionMessages = session.messages.slice();
-    session.messages.forEach(m => addMessage(m.role, m.text, m.timestamp, m.suggestions || []));
+    session.messages.forEach(m => addMessage(m.role, m.text, m.timestamp));
     showChatView();
-    // Enable end chat
     document.getElementById("cw-menu-end").classList.remove("disabled");
   }
 
@@ -720,7 +613,7 @@
   // ── Chat core ─────────────────────────────────────────────────────────────────
   function startNewChat(focus = true) {
     conversationId  = null;
-    _localSessionId = "local_" + Date.now(); // fresh ID for new session
+    _localSessionId = "local_" + Date.now();
     _sessionMessages = [];
     _lastDay = "";
     messagesEl.innerHTML = "";
@@ -728,7 +621,7 @@
     sendEl.disabled = true;
     document.getElementById("cw-menu-end").classList.add("disabled");
     if (focus) {
-      typeMessage("bot", _welcomeMsg, _starterSuggestions);
+      typeMessage("bot", _welcomeMsg);
       setTimeout(() => inputEl.focus(), 100);
     }
     showChatView();
@@ -737,7 +630,7 @@
   async function fetchSettings() {
     _lastDay = "";
     _sessionMessages = [];
-    typeMessage("bot", _welcomeMsg, _starterSuggestions);
+    typeMessage("bot", _welcomeMsg);
     document.getElementById("cw-menu-end").classList.remove("disabled");
     setTimeout(() => inputEl.focus(), 100);
   }
@@ -767,13 +660,12 @@
       });
       if (!res.ok || !res.body) {
         removeTyping();
-        typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.", _starterSuggestions);
+        typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.");
       } else {
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
         let answerText = "";
-        let finalSuggestions = _starterSuggestions;
         let receivedFirstToken = false;
 
         const handleEvent = (rawEvent) => {
@@ -799,9 +691,6 @@
               const meta = JSON.parse(data);
               if (meta && typeof meta.conversation_id === "string") {
                 conversationId = meta.conversation_id;
-              }
-              if (meta && Array.isArray(meta.suggestions)) {
-                finalSuggestions = meta.suggestions;
               }
             } catch {}
             return false;
@@ -849,7 +738,7 @@
         if (!streamHandle) {
           streamHandle = createStreamingBotMessage();
         }
-        finalizeStreamingBotMessage(streamHandle, answerText, finalSuggestions);
+        finalizeStreamingBotMessage(streamHandle, answerText);
         document.getElementById("cw-menu-end").classList.remove("disabled");
       }
     } catch {
@@ -857,7 +746,7 @@
       if (streamHandle && streamHandle.wrap && streamHandle.wrap.parentNode) {
         streamHandle.wrap.parentNode.removeChild(streamHandle.wrap);
       }
-      typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.", _starterSuggestions);
+      typeMessage("bot", "Sorry, I'm having trouble connecting. Please try again.");
     } finally {
       isLoading = false;
       sendEl.disabled = false;
@@ -921,7 +810,6 @@
     document.getElementById("cw-end-confirm-yes").addEventListener("click", () => {
       overlay.style.display = "none";
       saveCurrentSession(_sessionMessages);
-      // Clear chat so next open starts fresh
       messagesEl.innerHTML = "";
       conversationId = null;
       _sessionMessages = [];
@@ -930,7 +818,6 @@
       sendEl.disabled = true;
       inputEl.value = "";
       showChatView();
-      // Close widget
       isOpen = false;
       panel.classList.remove("open");
       bubble.setAttribute("aria-expanded", "false");
@@ -962,7 +849,6 @@
     else showHistoryView();
   });
 
-  // History panel "New chat" button
   document.getElementById("cw-history-new").addEventListener("click", () => {
     startNewChat();
   });
@@ -974,15 +860,14 @@
     bubble.setAttribute("aria-expanded", "true");
     hidePreview();
     if (messagesEl.children.length === 0) {
-      // Try to restore last session from localStorage
       const history = loadHistory();
       if (history.length > 0) {
-        const last = history[0]; // most recent session
+        const last = history[0];
         _lastDay         = "";
         _sessionMessages = last.messages.slice();
-        _localSessionId  = last.id; // restore stable local key
-        conversationId   = last.conversationId || null; // restore server ID if saved
-        last.messages.forEach(m => addMessage(m.role, m.text, m.timestamp, m.suggestions || []));
+        _localSessionId  = last.id;
+        conversationId   = last.conversationId || null;
+        last.messages.forEach(m => addMessage(m.role, m.text, m.timestamp));
         showChatView();
         setTimeout(() => {
           messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -1022,7 +907,6 @@
 
   document.getElementById("cw-close").addEventListener("click", () => {
     closeMenu();
-    // Just close — no confirmation needed. Chat is auto-saved.
     if (_sessionMessages.length) saveCurrentSession(_sessionMessages);
     isOpen = false;
     panel.classList.remove("open");
@@ -1063,7 +947,6 @@
       if (res.ok) {
         const s = await res.json();
         _welcomeMsg = s.welcome_message || "Hi! What can I help you with?";
-        _starterSuggestions = normalizeSuggestions(s.suggestions || _starterSuggestions);
         const titleEl = document.getElementById("cw-title");
         if (titleEl && s.display_name) titleEl.textContent = s.display_name;
         if (s.primary_color) currentPrimaryColor = s.primary_color;
