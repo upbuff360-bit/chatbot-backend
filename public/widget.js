@@ -411,6 +411,7 @@
   }
 
   function renderSuggestionChips(suggestions) {
+    return null;
     const items = normalizeSuggestions(suggestions);
     if (!items.length) return null;
 
